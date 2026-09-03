@@ -12,6 +12,49 @@ from relax.utils.env import Envs
 from relax.utils.utils import get_ray_accelerator_kwargs
 
 
+_CUDNN_PRELOAD_LIBRARIES = (
+    "libcudnn.so.9",
+    "libcudnn_graph.so.9",
+    "libcudnn_engines_runtime_compiled.so.9",
+    "libcudnn_ops.so.9",
+    "libcudnn_cnn.so.9",
+    "libcudnn_adv.so.9",
+    "libcudnn_engines_precompiled.so.9",
+    "libcudnn_heuristic.so.9",
+)
+
+
+def _ensure_cudnn_library_precedence(env_vars: dict[str, str]) -> None:
+    """Keep an explicitly selected cuDNN ahead of libraries added by
+    imports."""
+    cudnn_dir = env_vars.get("CUDNN_LIB_DIR")
+    if not cudnn_dir:
+        return
+    if not os.path.isdir(cudnn_dir):
+        raise RuntimeError(f"CUDNN_LIB_DIR does not exist for train actors: {cudnn_dir}")
+    entries = [
+        entry for entry in env_vars.get("LD_LIBRARY_PATH", "").split(os.pathsep) if entry and entry != cudnn_dir
+    ]
+    env_vars["LD_LIBRARY_PATH"] = os.pathsep.join([cudnn_dir, *entries])
+
+    cudnn_preloads = [os.path.join(cudnn_dir, name) for name in _CUDNN_PRELOAD_LIBRARIES]
+    missing = [path for path in cudnn_preloads if not os.path.isfile(path)]
+    if missing:
+        raise RuntimeError(f"CUDNN_LIB_DIR is missing required train-actor libraries: {missing}")
+
+    expected_cudnn_dir = os.path.realpath(cudnn_dir)
+    existing_preloads = []
+    for entry in env_vars.get("LD_PRELOAD", "").split(os.pathsep):
+        if not entry:
+            continue
+        if os.path.basename(entry).startswith("libcudnn"):
+            if os.path.dirname(os.path.realpath(entry)) != expected_cudnn_dir:
+                raise RuntimeError(f"Train actor LD_PRELOAD contains a conflicting cuDNN library: {entry}")
+            continue
+        existing_preloads.append(entry)
+    env_vars["LD_PRELOAD"] = os.pathsep.join([*cudnn_preloads, *existing_preloads])
+
+
 class RayTrainGroup:
     """A group of ray actors Functions start with 'async' should return list of
     object refs.
@@ -62,6 +105,11 @@ class RayTrainGroup:
             **self.runtime_env.get("env_vars", {}),
             **self.args.train_env_vars,
         }
+        # Importing OpenCV in the Ray job may prepend its bundled lib64 after
+        # the job runtime_env was installed. Reassert the selected cuDNN before
+        # spawning Megatron workers, otherwise Transformer Engine can load an
+        # incompatible cuDNN sublibrary even though CUDNN_LIB_DIR propagated.
+        _ensure_cudnn_library_precedence(env_vars)
 
         # Only preload the torch_memory_saver hook when it is actually the offload
         # mechanism. --selective-offload uses application-level selective CPU offload
@@ -80,7 +128,10 @@ class RayTrainGroup:
             )
             assert os.path.exists(dynlib_path), f"LD_PRELOAD so file {dynlib_path} does not exist."
 
-            env_vars["LD_PRELOAD"] = dynlib_path
+            existing_preloads = [
+                entry for entry in env_vars.get("LD_PRELOAD", "").split(os.pathsep) if entry and entry != dynlib_path
+            ]
+            env_vars["LD_PRELOAD"] = os.pathsep.join([dynlib_path, *existing_preloads])
             env_vars["TMS_INIT_ENABLE"] = "1"
             env_vars["TMS_INIT_ENABLE_CPU_BACKUP"] = "1"
 

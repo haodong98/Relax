@@ -1,12 +1,13 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import json
 import logging
 import os
 import random
 import socket
 import time
 from argparse import Namespace
-from functools import partial
+from functools import partial, wraps
 from typing import Any, List
 
 import ray
@@ -59,7 +60,7 @@ from relax.utils.opd.opd_utils import (
 )
 from relax.utils.reloadable_process_group import destroy_process_groups, monkey_patch_torch_dist, reload_process_groups
 from relax.utils.rotate_ckpt import rotate_ckpt
-from relax.utils.timer import Timer, inverse_timer, timer, with_defer
+from relax.utils.timer import Timer, inverse_timer, span_timer, timeline_step, timer, with_defer
 from relax.utils.tracking_utils import init_tracking
 from relax.utils.training import train_dump_utils
 from relax.utils.training.data_fields import build_data_fields
@@ -103,6 +104,93 @@ logger = logging.getLogger(__name__)
 
 
 ROLLOUT_MINI_BATCH_METAS_KEY = "rollout_mini_batch_metas"
+
+_CUDNN_RUNTIME_LIBRARIES = (
+    "libcudnn.so.9",
+    "libcudnn_graph.so.9",
+    "libcudnn_engines_runtime_compiled.so.9",
+    "libcudnn_ops.so.9",
+    "libcudnn_cnn.so.9",
+    "libcudnn_adv.so.9",
+    "libcudnn_engines_precompiled.so.9",
+    "libcudnn_heuristic.so.9",
+)
+
+
+def _validate_cudnn_runtime() -> dict[str, Any] | None:
+    """Fail before Megatron init if a selected train-actor cuDNN is mixed."""
+    cudnn_dir = os.environ.get("CUDNN_LIB_DIR")
+    if not cudnn_dir:
+        return None
+
+    import ctypes
+    import re
+    from pathlib import Path
+
+    expected_dir = Path(cudnn_dir).resolve()
+    version_header = expected_dir.parent / "include" / "cudnn_version.h"
+    header_text = version_header.read_text(encoding="utf-8")
+    expected_parts = tuple(
+        int(re.search(rf"#define CUDNN_{name} (\d+)", header_text).group(1))
+        for name in ("MAJOR", "MINOR", "PATCHLEVEL")
+    )
+    expected_version = expected_parts[0] * 10000 + expected_parts[1] * 100 + expected_parts[2]
+    global_get_version = ctypes.CDLL(None).cudnnGetVersion
+    global_get_version.restype = ctypes.c_size_t
+    global_version = int(global_get_version())
+    torch_version = torch.backends.cudnn.version()
+    if global_version != expected_version or torch_version != expected_version:
+        raise RuntimeError(
+            "Train actor loaded an unexpected cuDNN runtime: "
+            f"expected={expected_version}, global={global_version}, torch={torch_version}"
+        )
+
+    mapped_paths = sorted(
+        {
+            fields[-1]
+            for line in Path("/proc/self/maps").read_text(encoding="utf-8").splitlines()
+            if len(fields := line.split()) >= 6 and fields[-1].startswith("/")
+        }
+    )
+    mapped_cudnn = [path for path in mapped_paths if Path(path).name.startswith("libcudnn")]
+    mapped_realpaths = {str(Path(path).resolve()) for path in mapped_cudnn}
+    expected_realpaths = {str((expected_dir / name).resolve()) for name in _CUDNN_RUNTIME_LIBRARIES}
+    missing = sorted(expected_realpaths - mapped_realpaths)
+    foreign_components = sorted(
+        path
+        for path in mapped_cudnn
+        if not str(Path(path).resolve()).startswith(str(expected_dir) + os.sep)
+        and not Path(path).name.startswith("libcudnn.so.9")
+    )
+    if missing or foreign_components:
+        raise RuntimeError(
+            "Train actor has an incomplete or mixed cuDNN mapping: "
+            f"missing={missing}, foreign_components={foreign_components}"
+        )
+    return {
+        "cudnn_dir": str(expected_dir),
+        "expected_version": expected_version,
+        "global_version": global_version,
+        "torch_version": torch_version,
+        "mapped_cudnn": mapped_cudnn,
+        "ld_preload": os.environ.get("LD_PRELOAD", ""),
+    }
+
+
+def _bind_critical_path_step(func):
+    @wraps(func)
+    def wrapper(self, rollout_id, *args, **kwargs):
+        with timeline_step(compute_rollout_step(self.args, rollout_id)):
+            return func(self, rollout_id, *args, **kwargs)
+
+    return wrapper
+
+
+def _mark_critical_path_milestone(name: str) -> tuple[float, int]:
+    marked_at = time.time()
+    monotonic_ns = time.perf_counter_ns()
+    Timer().add_complete_span(name, start_wall_s=marked_at, end_wall_s=marked_at, duration_s=0.0)
+    return marked_at, monotonic_ns
 
 
 def _split_by_rollout_mini_counts(values: Any, counts: list[int]) -> list[Any]:
@@ -156,6 +244,9 @@ class MegatronTrainRayActor(TrainRayActor):
         with_ref: bool = False,
         with_opd_teacher: bool = False,
     ) -> int | None:
+        cudnn_runtime = _validate_cudnn_runtime()
+        if cudnn_runtime is not None and self._rank == 0:
+            logger.info("Train actor cuDNN runtime gate passed: %s", json.dumps(cudnn_runtime, sort_keys=True))
         with timer("init_actor"):
             return self._init(args, role, with_ref, with_opd_teacher)
 
@@ -528,7 +619,7 @@ class MegatronTrainRayActor(TrainRayActor):
         store_prefix: str = "",
         collect_topk: bool = False,
     ) -> dict[str, list[torch.Tensor]]:
-        with timer(f"{store_prefix}log_probs"):
+        with span_timer("critical_path.training_forward"), timer(f"{store_prefix}log_probs"):
             log_prob_func = get_log_probs_and_entropy
             if collect_topk:
                 log_prob_func = partial(log_prob_func, with_topk=True, topk_k=self.args.opd_log_prob_top_k)
@@ -541,12 +632,12 @@ class MegatronTrainRayActor(TrainRayActor):
                 store_prefix=store_prefix,
             )
 
-    def _run_step_evaluation(self, rollout_id: int, *, end_update_weight: bool = False) -> None:
+    def _run_step_evaluation(self, rollout_id: int, *, end_update_weight: bool = False) -> bool:
         is_sft = is_sft_mode(self.args)
         has_rollout = getattr(self, "rollout_manager", None) is not None
 
         if not is_sft and dist.get_rank() != 0:
-            return
+            return True
 
         if is_sft:
             should_run_eval = should_run_sft_eval(self.args, rollout_id)
@@ -567,22 +658,24 @@ class MegatronTrainRayActor(TrainRayActor):
             except Exception as e:
                 logger.warning(f"SFT eval/predict at rollout_id {rollout_id} failed: {e}")
                 raise
-            return
+            return True
 
         # RL path: trigger rollout-based evaluation if configured.
         # Telemetry marks for RL eval live on the Rollout side
         # (see Rollout._run_eval_with_mark), so we don't emit them here.
         if not has_rollout:
-            return
+            return True
         rollout_serve_url = get_serve_url("rollout")
+        release_succeeded = not end_update_weight
         try:
             # NOTE: /evaluate runs rollout-side inference and can legitimately
             # take much longer than a short RPC, so it is intentionally left
             # without an HTTP timeout -- a fixed timeout would falsely abort a
             # long eval. This block's failure is non-fatal (logged, training
             # continues).
-            response = requests.get(f"{rollout_serve_url}/evaluate", params={"train_step": rollout_id})
-            response.raise_for_status()
+            with span_timer("critical_path.rollout_evaluation"):
+                response = requests.get(f"{rollout_serve_url}/evaluate", params={"train_step": rollout_id})
+                response.raise_for_status()
         except Exception as e:
             logger.warning(f"Error during actor post-train evaluation for rollout_id {rollout_id}: {e}")
         finally:
@@ -590,18 +683,44 @@ class MegatronTrainRayActor(TrainRayActor):
             # monitoring stay paused forever. Short call -> keep the timeout;
             # swallow its own errors independently.
             if end_update_weight:
+                release_started_at = time.time()
+                release_started_ns = time.perf_counter_ns()
                 try:
                     response = requests.get(
                         f"{rollout_serve_url}/end_update_weight", timeout=self.args.rollout_http_timeout
                     )
                     response.raise_for_status()
+                    release_succeeded = True
                 except Exception as e:
                     logger.warning(f"Error ending update weight for rollout_id {rollout_id}: {e}")
+                finally:
+                    release_event = (
+                        "critical_path.weight_serving_ready"
+                        if release_succeeded
+                        else "diagnostic.weight_serving_release_failed"
+                    )
+                    release_ended_at = time.time()
+                    release_ended_ns = time.perf_counter_ns()
+                    Timer().add_complete_span(
+                        release_event,
+                        start_wall_s=release_started_at,
+                        end_wall_s=release_ended_at,
+                        duration_s=(release_ended_ns - release_started_ns) / 1e9,
+                    )
+                    if release_succeeded and dist.get_rank(group=get_gloo_group()) == 0:
+                        train_dump_utils.append_weight_serving_ready_marker(
+                            self.args,
+                            step=compute_rollout_step(self.args, rollout_id),
+                            wall_time_s=release_ended_at,
+                            monotonic_ns=release_ended_ns,
+                        )
+        return release_succeeded
 
     def _request_rollout_evaluation(self, rollout_id: int, *, end_update_weight: bool = False) -> None:
         """Backward-compatible name kept for existing internal call sites."""
         self._run_step_evaluation(rollout_id, end_update_weight=end_update_weight)
 
+    @_bind_critical_path_step
     def train(self, rollout_id: int) -> None:
         if self.args.offload_rollout and dist.get_rank() == 0:
             pre_train_offload_handles = []
@@ -684,7 +803,7 @@ class MegatronTrainRayActor(TrainRayActor):
             while batch_index < num_rollout_minis and not self.all_consumed(task_name, rollout_id):
                 consumer = "critic" if self.role == "critic" else "actor"
                 data_fields = build_data_fields(self.args, consumer=consumer)
-                with timer("train_get_data"):
+                with span_timer("critical_path.data_wait"), timer("train_get_data"):
                     rollout_data, batch_meta = self._get_data_from_transfer_queue(
                         task_name, rollout_id, data_fields, batch_size, batch_index
                     )
@@ -697,7 +816,8 @@ class MegatronTrainRayActor(TrainRayActor):
                         )
                     fetch_iter += 1
                     if empty_poll_sleep_s > 0:
-                        time.sleep(empty_poll_sleep_s)
+                        with span_timer("critical_path.data_wait"):
+                            time.sleep(empty_poll_sleep_s)
                     continue
                 batch_index += 1
                 if is_sft_mode(self.args):
@@ -732,15 +852,16 @@ class MegatronTrainRayActor(TrainRayActor):
     def train_critic(self, rollout_id: int, rollout_data: RolloutBatch) -> None:
         # Create data iterator for log_probs and train.
         data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
-        rollout_data.update(
-            forward_only(
-                get_values,
-                self.args,
-                self.model,
-                data_iterator,
-                num_microbatches,
+        with span_timer("critical_path.training_forward"):
+            rollout_data.update(
+                forward_only(
+                    get_values,
+                    self.args,
+                    self.model,
+                    data_iterator,
+                    num_microbatches,
+                )
             )
-        )
         # Ship values to TransferQueue before we sleep — CP all-gather needs
         # live NCCL groups and .cpu() needs live GPU memory.
         self._put_critic_values_to_transfer_queue(rollout_data)
@@ -755,6 +876,16 @@ class MegatronTrainRayActor(TrainRayActor):
             self.opt_param_scheduler,
             data_iterator,
             num_microbatches,
+        )
+        # Critic processes own a separate Timer singleton from the actor. They
+        # must drain and publish their critical records explicitly; flush alone
+        # only reports records that have already reached MetricsService.
+        log_perf_data(
+            rollout_id,
+            self.args,
+            flops_counter=self.flops_counter,
+            pid_base=5000,
+            component="critic",
         )
         tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
         # Save critic ckpt while still awake — the outer critic loop used to
@@ -948,8 +1079,6 @@ class MegatronTrainRayActor(TrainRayActor):
                 all_audio_seqlens, audio_seqlens, group=mpu.get_data_parallel_group(with_context_parallel=False)
             )
             Timer().audio_seqlens = sum(all_audio_seqlens, [])
-        log_perf_data(rollout_id, self.args, flops_counter=self.flops_counter)
-
         is_train_done = (rollout_id + 1) == self.args.num_rollout
         if self.args.save is not None and (
             self.args.rotate_ckpt
@@ -962,7 +1091,19 @@ class MegatronTrainRayActor(TrainRayActor):
             if self.args.offload_train:
                 self.sleep()
             if has_rollout:
-                self.update_weights()
+                with span_timer("critical_path.weight_update"):
+                    self.update_weights()
+                serving_ready_at, serving_ready_ns = _mark_critical_path_milestone(
+                    "critical_path.weight_serving_ready"
+                )
+                if dist.get_rank(group=get_gloo_group()) == 0:
+                    train_dump_utils.append_weight_serving_ready_marker(
+                        self.args,
+                        step=compute_rollout_step(self.args, rollout_id),
+                        wall_time_s=serving_ready_at,
+                        monotonic_ns=serving_ready_ns,
+                    )
+        log_perf_data(rollout_id, self.args, flops_counter=self.flops_counter, component="actor")
         tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
         # RL-only generative eval (uses SGLang via rollout_manager.eval). SFT
         # uses local eval/predict runner below.
@@ -976,6 +1117,7 @@ class MegatronTrainRayActor(TrainRayActor):
         if is_train_done:
             self._wait_for_previous_eval()
 
+    @_bind_critical_path_step
     def compute_ref_log_prob(self, rollout_id: int) -> None:
         if self.args.use_routing_replay:
             os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
@@ -1018,6 +1160,7 @@ class MegatronTrainRayActor(TrainRayActor):
         self.recv_weight_fully_async(rollout_id)
         log_perf_data_fwd(self.args, rollout_id)
 
+    @_bind_critical_path_step
     def compute_actor_log_prob(self, rollout_id: int) -> None:
         if self.args.use_routing_replay:
             if self.args.use_rollout_routing_replay:
@@ -1217,6 +1360,7 @@ class MegatronTrainRayActor(TrainRayActor):
             if clear_routing_replay_forward:
                 RoutingReplay.clear_all_forward()
 
+    @_bind_critical_path_step
     def train_hybrid(self, rollout_id) -> None:
         """Hybrid mode: actor internally handles ref/actor_fwd/advantages
         computation via _switch_model, then trains, while using the async data
@@ -1283,7 +1427,7 @@ class MegatronTrainRayActor(TrainRayActor):
                     data_fields.append("multimodal_train_inputs")
                 if self.args.use_opd and self.args.opd_type == "sglang":
                     data_fields.append("teacher_log_probs")
-                with timer("train_get_data"):
+                with span_timer("critical_path.data_wait"), timer("train_get_data"):
                     sub_batch, batch_meta = self._get_data_from_transfer_queue(
                         "train", rollout_id, data_fields, batch_size, batch_index
                     )
@@ -1299,7 +1443,8 @@ class MegatronTrainRayActor(TrainRayActor):
                         last_warn = now
                     # Throttle the spin so the controller is not hammered with metadata
                     # polls while we wait for upstream data.
-                    time.sleep(0.1)
+                    with span_timer("critical_path.data_wait"):
+                        time.sleep(0.1)
                     continue
                 last_progress = time.monotonic()
                 last_warn = last_progress
@@ -1405,8 +1550,6 @@ class MegatronTrainRayActor(TrainRayActor):
                 all_audio_seqlens, audio_seqlens, group=mpu.get_data_parallel_group(with_context_parallel=False)
             )
             Timer().audio_seqlens = sum(all_audio_seqlens, [])
-        log_perf_data(rollout_id, self.args, flops_counter=self.flops_counter)
-
         is_train_done = (rollout_id + 1) == self.args.num_rollout
         if self.args.save is not None and (
             self.args.rotate_ckpt
@@ -1419,6 +1562,7 @@ class MegatronTrainRayActor(TrainRayActor):
             # In debug_train_only mode no rollout/eval services exist, so skip the
             # weight-sync + eval coordination below (mirrors `train`'s debug path
             # which never touches those services). Metrics are still flushed.
+            log_perf_data(rollout_id, self.args, flops_counter=self.flops_counter, component="actor")
             tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
             return
 
@@ -1429,14 +1573,17 @@ class MegatronTrainRayActor(TrainRayActor):
         # partially-filled partition, deadlocking against the staleness bound.
         # Returned flags are for update_weights_fully_async only — hybrid uses
         # the sync update_weights path so we just discard them.
-        self._wait_for_previous_eval()
-        self._check_services_health()
+        with span_timer("critical_path.weight_gate_wait"):
+            self._wait_for_previous_eval()
+            self._check_services_health()
 
         # Sync weights to rollout via UpdateWeightFromTensor (colocate mode)
-        self.update_weights()
-        tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
+        with span_timer("critical_path.weight_update"):
+            self.update_weights()
         dist.barrier(group=get_gloo_group())
         self._run_step_evaluation(rollout_id, end_update_weight=True)
+        log_perf_data(rollout_id, self.args, flops_counter=self.flops_counter, component="actor")
+        tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
 
         # On the final training step the rollout component has already exited
         # its main loop, so the eval just triggered above will not be awaited
@@ -1445,6 +1592,7 @@ class MegatronTrainRayActor(TrainRayActor):
         if is_train_done:
             self._wait_for_previous_eval()
 
+    @_bind_critical_path_step
     def train_async(self, rollout_id) -> None:
         if self.args.use_routing_replay:
             os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
@@ -1514,12 +1662,18 @@ class MegatronTrainRayActor(TrainRayActor):
             )
 
             # Wait for prior eval before pausing rollout for weight sync.
-            self._wait_for_previous_eval()
-
-            rollout_only, actor_fwd_only = self._check_services_health()
-            self.update_weights_fully_async(rollout_id, rollout_only=rollout_only, actor_fwd_only=actor_fwd_only)
+            with span_timer("critical_path.weight_gate_wait"):
+                self._wait_for_previous_eval()
+                rollout_only, actor_fwd_only = self._check_services_health()
+            with span_timer("critical_path.weight_update"):
+                self.update_weights_fully_async(
+                    rollout_id,
+                    rollout_only=rollout_only,
+                    actor_fwd_only=actor_fwd_only,
+                )
             dist.barrier(group=get_gloo_group())
-            self._run_step_evaluation(rollout_id, end_update_weight=True)
+            if not actor_fwd_only:
+                self._run_step_evaluation(rollout_id, end_update_weight=True)
             # On the final training step the rollout component has already
             # exited its main loop, so the eval just triggered above will not
             # be awaited anywhere. Block until it finishes; otherwise the
@@ -1563,7 +1717,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 all_audio_seqlens, audio_seqlens, group=mpu.get_data_parallel_group(with_context_parallel=False)
             )
             Timer().audio_seqlens = sum(all_audio_seqlens, [])
-        log_perf_data(rollout_id, self.args, flops_counter=self.flops_counter)
+        log_perf_data(rollout_id, self.args, flops_counter=self.flops_counter, component="actor")
         tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
 
     @timer
@@ -1711,6 +1865,8 @@ class MegatronTrainRayActor(TrainRayActor):
         # Default: both services healthy → update both
         rollout_only = False
         actor_fwd_only = False
+        strict_weight_publication = os.environ.get("RELAX_REQUIRE_WEIGHT_PUBLICATION", "0") == "1"
+        health_check_failed = False
 
         # When true_on_policy_mode is enabled, actor_fwd is intentionally absent
         # (its log_probs are recomputed inline by the train forward). Force
@@ -1721,6 +1877,7 @@ class MegatronTrainRayActor(TrainRayActor):
             # Check rollout service
             try:
                 rollout_serve_url = get_serve_url("rollout")
+                deadline = time.monotonic() + max(1, int(self.args.distributed_timeout_minutes) * 60)
                 while True:
                     response = requests.get(
                         f"{rollout_serve_url}/can_do_update_weight_for_async",
@@ -1729,17 +1886,22 @@ class MegatronTrainRayActor(TrainRayActor):
                     response.raise_for_status()
                     res = response.json()
                     if res:
-                        response = requests.get(f"{rollout_serve_url}/recover_rollout_engines")
+                        response = requests.get(
+                            f"{rollout_serve_url}/recover_rollout_engines",
+                            timeout=self.args.rollout_http_timeout,
+                        )
                         response.raise_for_status()
                         break
-                    else:
-                        time.sleep(1)
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("rollout weight-publication gate exceeded distributed timeout")
+                    time.sleep(1)
             except Exception as e:
                 logger.warning(
                     f"Error checking rollout service: {e}, maybe caused by rollout server failure. "
                     "Will continue without rollout update for this step."
                 )
                 actor_fwd_only = True
+                health_check_failed = True
 
             # Check actor_fwd service. Skip the probe when actor_fwd is
             # intentionally absent — either true_on_policy_mode (log_probs
@@ -1758,17 +1920,21 @@ class MegatronTrainRayActor(TrainRayActor):
                         "Will continue without actor_fwd update for this step."
                     )
                     rollout_only = True
+                    health_check_failed = True
 
         # Broadcast results from rank 0 to all ranks via allreduce
         # Encode booleans as integers: 1 = skip, 0 = healthy
         flags = torch.tensor(
-            [int(rollout_only), int(actor_fwd_only)],
+            [int(rollout_only), int(actor_fwd_only), int(health_check_failed)],
             dtype=torch.int32,
             device="cpu",
         )
         dist.all_reduce(flags, op=dist.ReduceOp.MAX, group=get_gloo_group())
         rollout_only = bool(flags[0].item())
         actor_fwd_only = bool(flags[1].item())
+        health_check_failed = bool(flags[2].item())
+        if strict_weight_publication and health_check_failed:
+            raise RuntimeError("strict weight-publication health gate failed; refusing a partial update")
 
         return rollout_only, actor_fwd_only
 
@@ -2060,22 +2226,24 @@ class MegatronTrainRayActor(TrainRayActor):
         batch_index = 0
         empty_streak = 0
         while not self.all_consumed(task_name, rollout_id, partition_id=partition_id, streaming=True):
-            rollout_data, batch_meta = get_data_from_transfer_queue(
-                self.args,
-                self.data_system_client,
-                data_fields,
-                batch_size=None,
-                partition_id=partition_id,
-                task_name=task_name,
-                sampling_config=sampling_config,
-                batch_index=batch_index,
-                broadcast_pp=False,
-                token_budget=token_budget,
-                allow_underfill=True,
-            )
+            with span_timer("critical_path.data_wait"):
+                rollout_data, batch_meta = get_data_from_transfer_queue(
+                    self.args,
+                    self.data_system_client,
+                    data_fields,
+                    batch_size=None,
+                    partition_id=partition_id,
+                    task_name=task_name,
+                    sampling_config=sampling_config,
+                    batch_index=batch_index,
+                    broadcast_pp=False,
+                    token_budget=token_budget,
+                    allow_underfill=True,
+                )
             if rollout_data is None:
                 empty_streak += 1
-                time.sleep(min(0.2 * empty_streak, 2.0))
+                with span_timer("critical_path.data_wait"):
+                    time.sleep(min(0.2 * empty_streak, 2.0))
                 continue
             empty_streak = 0
             mbs.append((rollout_data, batch_meta))

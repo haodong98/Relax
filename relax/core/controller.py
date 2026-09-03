@@ -29,7 +29,7 @@ from relax.agentic.session.service import (
     deploy_agentic_chat_api_services,
     shutdown_agentic_chat_api_services,
 )
-from relax.core.optional_roles import register_extra_roles
+from relax.core.optional_roles import DEDICATED_JUDGE_ROLES, register_extra_roles
 from relax.core.registry import ALGOS, ROLES, process_role
 from relax.core.service import Service, create_placement_group
 from relax.distributed.checkpoint_service.coordinator.service import create_dcs_deployment
@@ -62,6 +62,40 @@ def _is_colocate(config: Namespace) -> bool:
 logger = get_logger(__name__)
 
 ACTOR_ROLLOUT_PG_ROLES = ["actor", "rollout", "genrm"]
+
+
+def _strict_pack_blocks_fit(required_blocks: list[int], node_capacities: list[int]) -> bool:
+    """Return whether all STRICT_PACK GPU blocks fit on raw node capacities."""
+    blocks = sorted((int(block) for block in required_blocks if block > 0), reverse=True)
+    capacities = tuple(sorted((int(capacity) for capacity in node_capacities if capacity > 0), reverse=True))
+    if not blocks:
+        return True
+    if not capacities or blocks[0] > capacities[0]:
+        return False
+
+    seen: set[tuple[int, tuple[int, ...]]] = set()
+
+    def _place(block_index: int, remaining: tuple[int, ...]) -> bool:
+        if block_index == len(blocks):
+            return True
+        state = (block_index, remaining)
+        if state in seen:
+            return False
+        seen.add(state)
+        block = blocks[block_index]
+        tried_capacities: set[int] = set()
+        for index, capacity in enumerate(remaining):
+            if capacity < block or capacity in tried_capacities:
+                continue
+            tried_capacities.add(capacity)
+            next_remaining = list(remaining)
+            next_remaining[index] -= block
+            next_remaining.sort(reverse=True)
+            if _place(block_index + 1, tuple(next_remaining)):
+                return True
+        return False
+
+    return _place(0, capacities)
 
 
 def _actor_rollout_pg_roles(config: Namespace) -> list[str]:
@@ -120,6 +154,13 @@ class Controller:
         try:
             self.register_all_serve()
         except Exception as e:
+            for role in DEDICATED_JUDGE_ROLES:
+                service = self.serve_dict.get(role)
+                if service is not None:
+                    try:
+                        service.shutdown_owned()
+                    except Exception:
+                        logger.warning(f"Failed to roll back partially created judge {role}", exc_info=True)
             self._report_error_to_metrics_service(e)
             raise
 
@@ -346,6 +387,64 @@ class Controller:
                 f"Either add more GPU nodes, reduce GPU allocation per role, "
                 f"or switch to colocate mode to share GPUs between actor and rollout."
             )
+        self._validate_dedicated_judge_strict_pack_capacity(roles_to_create)
+
+    def _validate_dedicated_judge_strict_pack_capacity(self, roles_to_create) -> None:
+        """Fail fast when dedicated Judge TP blocks cannot fit on any nodes.
+
+        This validates immutable node topology only. Other services can still
+        consume capacity after this check, so the bounded PG-ready timeout is
+        retained as the final protection against dynamic fragmentation.
+        """
+        required_blocks = [
+            int(num_gpus)
+            for role, _cls, num_gpus, _data_source in roles_to_create
+            if str(role) in DEDICATED_JUDGE_ROLES and int(num_gpus) > 0
+        ]
+        if not required_blocks:
+            return
+        try:
+            nodes = ray.nodes()
+        except Exception as exc:
+            logger.warning("Could not inspect Ray nodes for dedicated Judge STRICT_PACK capacity: %s", exc)
+            return
+        accelerator = device_utils.get_ray_accelerator_name()
+        node_group = os.environ.get("RELAX_INITIAL_NODE_GROUP", "").strip()
+        affinity_enabled = bool(getattr(self.config, "enable_affinity", False) and node_group)
+        capacities: list[int] = []
+        node_details: list[dict[str, Any]] = []
+        for node in nodes:
+            if not isinstance(node, dict) or not node.get("Alive", False):
+                continue
+            resources = node.get("Resources")
+            if not isinstance(resources, dict):
+                continue
+            gpu_capacity = int(resources.get(accelerator, 0) or 0)
+            cpu_capacity = int(resources.get("CPU", 0) or 0)
+            effective_capacity = min(gpu_capacity, cpu_capacity)
+            if affinity_enabled:
+                effective_capacity = min(
+                    effective_capacity,
+                    int(resources.get(f"{node_group}_gpu", 0) or 0),
+                    int(resources.get(f"{node_group}_cpu", 0) or 0),
+                )
+            capacities.append(effective_capacity)
+            node_details.append(
+                {
+                    "node_id": node.get("NodeID") or node.get("NodeManagerAddress") or "unknown",
+                    "gpu_capacity": gpu_capacity,
+                    "cpu_capacity": cpu_capacity,
+                    "effective_capacity": effective_capacity,
+                }
+            )
+        if _strict_pack_blocks_fit(required_blocks, capacities):
+            return
+        raise RuntimeError(
+            "Dedicated Judge STRICT_PACK topology is infeasible before service launch: "
+            f"required per-role GPU blocks={sorted(required_blocks, reverse=True)}, "
+            f"eligible node capacities={node_details}, affinity_enabled={affinity_enabled}. "
+            "Each Judge TP block must fit on one eligible node; add/rebalance nodes or reduce its TP size."
+        )
 
     def _maybe_resolve_num_rollout(self, roles_to_create):
         # Resolve --num-rollout from --num-epoch here, before any service is
@@ -420,7 +519,8 @@ class Controller:
                 continue
             num_serves, num_gpus = self.config.resource.get(role)
             assert num_serves == 1, f"Currently only support num_serves=1 for {role}, but received {num_serves=}"
-            self._health_manager.mark_healthy(role)
+            if role not in DEDICATED_JUDGE_ROLES:
+                self._health_manager.mark_healthy(role)
             logger.info(f"Service {role} start creating.")
 
             roles_to_create.append((role, cls, num_gpus, data_source))
@@ -455,14 +555,16 @@ class Controller:
                 self.serve_dict[role] = service  # type: ignore
         else:
             # Parallel creation using ThreadPool to ensure all services are registered
-            logger.info(f"Using parallel creation mode (fully_async=True) with {len(roles_to_create)} services")
+            core_roles = [item for item in roles_to_create if item[0] not in DEDICATED_JUDGE_ROLES]
+            judge_roles = [item for item in roles_to_create if item[0] in DEDICATED_JUDGE_ROLES]
+            logger.info(f"Using parallel creation mode (fully_async=True) with {len(core_roles)} core services")
 
             # Use ThreadPoolExecutor (not ProcessPoolExecutor) to avoid pickling issues
             # ThreadPoolExecutor shares the same process memory, no serialization needed
-            with concurrent.futures.ThreadPoolExecutor(max_workers=len(roles_to_create)) as executor:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(core_roles))) as executor:
                 # Submit all creation tasks and collect futures
                 futures_dict = {}
-                for role, cls, num_gpus, data_source in roles_to_create:
+                for role, cls, num_gpus, data_source in core_roles:
                     future = executor.submit(
                         self._create_service_task,
                         role,
@@ -495,7 +597,7 @@ class Controller:
                         else:
                             self.serve_dict[role] = service  # type: ignore
                             completed_count += 1
-                            logger.info(f"Service {role} registered ({completed_count}/{len(roles_to_create)})")
+                            logger.info(f"Service {role} registered ({completed_count}/{len(core_roles)})")
                     except Exception as e:
                         logger.exception(f"Exception while processing service creation result: {e}")
                         role = futures_dict[future]
@@ -512,6 +614,28 @@ class Controller:
                 if failed_roles:
                     error_msg = "; ".join([f"{r}: {e}" for r, e in failed_roles])
                     raise RuntimeError(f"Failed to register {len(failed_roles)} services: {error_msg}")
+
+            # Dedicated judges reserve disjoint port bands. Create them serially
+            # after core roles to avoid port/placement races.
+            for role, cls, num_gpus, data_source in judge_roles:
+                role, service, error = self._create_service_task(
+                    role, cls, num_gpus, data_source, actor_rollout_pgs, actor_rollout_pg_roles
+                )
+                if error is not None:
+                    raise RuntimeError(f"Failed to create service {role}: {error}")
+                self.serve_dict[role] = service
+
+        for role in DEDICATED_JUDGE_ROLES:
+            service = self.serve_dict.get(role)
+            if service is None:
+                continue
+            readiness = service.wait_ready()
+            spec = self.config.judge_services.by_role(role)
+            if readiness.get("service") != role or readiness.get("model_path") != spec.model_path:
+                raise RuntimeError(f"Judge readiness identity mismatch for {role}: {readiness}")
+            if role == "judge_multiturn_vlm" and readiness.get("processor") is not True:
+                raise RuntimeError(f"Judge {role} readiness did not validate a multimodal processor")
+            self._health_manager.mark_healthy(role)
 
         logger.info(f"All {len(self.serve_dict)} services registered successfully: {list(self.serve_dict.keys())}")
 
@@ -699,6 +823,18 @@ class Controller:
             except Exception as e:
                 logger.warning(f"Failed to dispose RolloutManager: {e}")
 
+        for role in DEDICATED_JUDGE_ROLES:
+            service = self.serve_dict.get(role)
+            if service is not None:
+                service.shutdown_owned()
+        if getattr(self.config, "judge_services", None) is not None:
+            try:
+                from relax.utils.genrm_client import close_all_genrm_clients
+
+                run(close_all_genrm_clients())
+            except Exception as e:
+                logger.warning(f"Failed to close judge clients: {e}")
+
         shutdown_managed_opd_teacher(self._teacher_manager)
 
         self._shutdown_agentic_rollout_services()
@@ -734,7 +870,6 @@ class Controller:
             role: Service role name to restart.
         """
         logger.info(f"Restarting service '{role}'...")
-        serve.delete(role)
         # Must mirror register_all_serve's algo-key resolution. SFT mode is
         # identified by ``loss_type == "sft"``, not by ``advantage_estimator``
         # (Megatron's parser doesn't accept "sft" as an --advantage-estimator

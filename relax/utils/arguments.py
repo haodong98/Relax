@@ -2119,6 +2119,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Type of the reward model",
             )
             parser.add_argument(
+                "--judge-services-config",
+                type=json.loads,
+                default=None,
+                help="JSON configuration for the two required local agentic judge services.",
+            )
+            parser.add_argument(
                 "--rm-type-fallback",
                 type=str,
                 default=None,
@@ -2689,6 +2695,10 @@ def _normalize_sync_ppo_kl_args(args) -> bool:
 
 
 def slime_validate_args(args):
+    from relax.utils.judge_config import validate_dual_judge_args
+
+    validate_dual_judge_args(args)
+
     # Backward compatibility: old scripts may pass --enable-gloo-process-groups
     if not hasattr(args, "use_gloo_process_groups"):
         args.use_gloo_process_groups = getattr(args, "enable_gloo_process_groups", False)

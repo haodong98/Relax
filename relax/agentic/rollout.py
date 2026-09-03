@@ -18,7 +18,7 @@ from relax.agentic.pipeline.runtime import (
     RuntimeDomain,
     get_agentic_runtime_resources,
 )
-from relax.agentic.profile import TRACE_KEY
+from relax.agentic.profile import TRACE_KEY, agentic_span_clock_host
 from relax.engine.filters.base_types import MetricGatherer, call_dynamic_filter
 from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
 from relax.utils.logging_utils import get_logger
@@ -32,7 +32,13 @@ from relax.utils.metrics.metric_utils import (
 from relax.utils.misc import group_by
 from relax.utils.profile_utils import start_sglang_profile, stop_sglang_profile
 from relax.utils.training.eval_config import EvalDatasetConfig
-from relax.utils.training.train_dump_utils import save_debug_rollout_data, save_rollout_result_jsonl
+from relax.utils.training.train_dump_utils import (
+    append_agentic_accounting_marker,
+    append_reward_workload_markers,
+    save_debug_rollout_data,
+    save_reward_trace_snapshots_jsonl,
+    save_rollout_result_jsonl,
+)
 from relax.utils.types import Sample
 
 from .pipeline.prepare import PrepareDomain
@@ -41,6 +47,9 @@ from .pipeline.transfer import TransferDomain
 
 
 logger = get_logger(__name__)
+
+# How long the resident dataflow may make zero progress before it logs why.
+_DATAFLOW_STALL_REPORT_AFTER_S = 120.0
 _AGENT_METADATA_INTERNAL_KEYS = {TRACE_KEY}
 _IDLE_HEARTBEAT_INTERVAL_S = 30.0
 _BACKGROUND_POLL_INTERVAL_S = 0.05
@@ -52,6 +61,41 @@ _RESIDENT_PIPELINE_DEFERRED_EVAL_ROLLOUT_ID: int | None = None
 _RESIDENT_ASYNC_LOOP: asyncio.AbstractEventLoop | None = None
 _RESIDENT_ASYNC_THREAD: threading.Thread | None = None
 _RESIDENT_ASYNC_LOCK = threading.Lock()
+
+
+def _sample_log_summary(sample: Sample) -> dict[str, Any]:
+    """Return bounded diagnostics without formatting the trajectory or image
+    tensors."""
+    reward = sample.reward
+    if isinstance(reward, dict):
+        reward_summary: Any = {
+            str(key): value for key, value in reward.items() if isinstance(value, (bool, int, float))
+        }
+    elif isinstance(reward, (bool, int, float)):
+        reward_summary = reward
+    else:
+        reward_summary = type(reward).__name__ if reward is not None else None
+
+    multimodal_shapes = {}
+    multimodal_train_inputs = sample.multimodal_train_inputs
+    if isinstance(multimodal_train_inputs, dict):
+        for key, value in multimodal_train_inputs.items():
+            shape = getattr(value, "shape", None)
+            if shape is not None:
+                multimodal_shapes[str(key)] = tuple(shape)
+
+    return {
+        "session_id": sample.session_id,
+        "index": sample.index,
+        "status": str(sample.status),
+        "prompt_chars": len(sample.prompt or ""),
+        "response_chars": len(sample.response or ""),
+        "prompt_tokens": max(0, len(sample.tokens) - int(sample.response_length or 0)),
+        "response_tokens": int(sample.response_length or 0),
+        "multimodal_shapes": multimodal_shapes,
+        "reward": reward_summary,
+        "weight_versions": sample.weight_versions,
+    }
 
 
 def _eval_scope_id(*, dataset_name: str, rollout_id: int) -> str:
@@ -216,6 +260,16 @@ class AgenticResidentPipeline:
         # many groups into its previous partition. 0 before the first step / when a step
         # fully met its target. Only meaningful under fully_async.
         self._last_step_current_deficit = 0
+        # Stall reporting: the per-domain accounting snapshots are only emitted at step
+        # boundaries, so a step that can never complete produces endless prepare churn
+        # and no clue about which stage stopped advancing. Track the last time the
+        # dataflow actually moved so a wedged pipeline can describe itself.
+        self._last_pump_progress_at = time.monotonic()
+        self._last_stall_report_at = time.monotonic()
+        # Service startup takes minutes during which the pump correctly has nothing
+        # to move; only an idle pipeline that previously ran is a stall worth
+        # reporting, so hold fire until the dataflow has moved at least once.
+        self._dataflow_ever_progressed = False
 
     def _dataflow_lock(self) -> asyncio.Lock:
         lock = self.resident_dataflow_lock
@@ -240,8 +294,54 @@ class AgenticResidentPipeline:
                 if await self._pump_transfer_once():
                     tick_progressed = True
                 if not tick_progressed:
+                    self._report_dataflow_stall(progressed)
                     return progressed
                 progressed = True
+
+    def _report_dataflow_stall(self, progressed: bool) -> None:
+        """Log per-domain accounting when the resident dataflow stops
+        advancing.
+
+        Every pump stage (prepare -> admission -> runtime -> reward ->
+        transfer) reports whether it moved anything. When none of them move for
+        a sustained period the step cannot finish, but that is otherwise
+        invisible: the domain accounting snapshots are only emitted at step
+        boundaries, which a wedged step never reaches. Emitting them here turns
+        "the log shows endless prepare churn" into "runtime holds N
+        materialized records that reward never saw".
+        """
+        now = time.monotonic()
+        if progressed:
+            self._last_pump_progress_at = now
+            self._dataflow_ever_progressed = True
+            return
+        if not self._dataflow_ever_progressed:
+            # Still starting up (services deploying); an idle pump is expected.
+            self._last_pump_progress_at = now
+            return
+        if now - self._last_pump_progress_at < _DATAFLOW_STALL_REPORT_AFTER_S:
+            return
+        if now - self._last_stall_report_at < _DATAFLOW_STALL_REPORT_AFTER_S:
+            return
+        self._last_stall_report_at = now
+        stalled_for = now - self._last_pump_progress_at
+        snapshots: dict[str, Any] = {}
+        for name, domain in (
+            ("runtime", self.runtime_domain),
+            ("reward", self.reward_domain),
+            ("transfer", self.transfer_domain),
+        ):
+            if domain is None:
+                continue
+            try:
+                snapshots[name] = dict(domain.accounting_snapshot())
+            except Exception as exc:  # noqa: BLE001 -- diagnostics must never break the pump
+                snapshots[name] = {"accounting_snapshot_failed": f"{type(exc).__name__}: {exc}"}
+        logger.warning(
+            "Agentic dataflow made no progress for %.0fs; per-domain accounting: %s",
+            stalled_for,
+            snapshots,
+        )
 
     @property
     def resident_group_count(self) -> int:
@@ -365,9 +465,16 @@ class AgenticResidentPipeline:
     async def _pump_reward_to_transfer_once(self) -> bool:
         reward_domain = self.reward_domain
         transfer_domain = self.transfer_domain
+        runtime_domain = self.runtime_domain
         if reward_domain is None:
             raise RuntimeError("Agentic reward-to-transfer pump requires initialized reward domain.")
         progressed = await reward_domain.step_once()
+        rejected_group_keys = reward_domain.drain_rejected_group_keys()
+        if rejected_group_keys:
+            if runtime_domain is None:
+                raise RuntimeError("Agentic judge rejection requires initialized runtime domain.")
+            await runtime_domain.drop_groups_by_key(rejected_group_keys)
+            progressed = True
         if transfer_domain is None:
             return progressed
 
@@ -393,12 +500,7 @@ class AgenticResidentPipeline:
         if step_handle is None or step_handle.first_rollout_sample_logged or not released_groups:
             return
         sample = released_groups[0][0][0] if isinstance(released_groups[0][0], list) else released_groups[0][0]
-        logger.info(
-            "First rollout sample: %s, label: %s, reward: %s",
-            [str(sample.prompt) + sample.response],
-            str(sample.label)[:100],
-            sample.reward,
-        )
+        logger.info("First rollout sample summary: %s", _sample_log_summary(sample))
         step_handle.first_rollout_sample_logged = True
 
     def _raise_resident_dataflow_error(self) -> None:
@@ -474,6 +576,10 @@ class AgenticResidentPipeline:
 
     async def shutdown(self) -> None:
         await self.stop_resident_dataflow()
+        close_judge_clients = (
+            self.reward_domain is not None
+            and getattr(self.reward_domain.args, "rm_type", None) == "dual-agentic-judge"
+        )
         domains = (
             ("prepare_domain", self.prepare_domain),
             ("runtime_domain", self.runtime_domain),
@@ -485,6 +591,10 @@ class AgenticResidentPipeline:
                 continue
             await domain.shutdown()
             setattr(self, attr_name, None)
+        if close_judge_clients:
+            from relax.utils.genrm_client import close_all_genrm_clients
+
+            await close_all_genrm_clients()
         self.step_admission_closed = False
 
     async def init_pipeline(
@@ -770,13 +880,23 @@ class AgenticResidentPipeline:
             "reward_waiting_groups": reward_snapshot["waiting_groups"],
             "reward_waiting_records": reward_snapshot["waiting_records"],
             "reward_ready_groups": reward_snapshot["ready_groups"],
+            "reward_completed_groups": reward_snapshot["completed_groups"],
+            "reward_inflight_sample_rewards": reward_snapshot["inflight_sample_rewards"],
+            "reward_inflight_group_rewards": reward_snapshot["inflight_group_rewards"],
             "transfer_committed_current_groups": transfer_snapshot["committed_current_groups"],
             "transfer_committed_previous_groups": transfer_snapshot["committed_previous_groups"],
             "transfer_current_quota": transfer_snapshot["current_partition_quota"],
             "transfer_previous_quota": transfer_snapshot["previous_partition_quota"],
+            "transfer_buffer_groups": transfer_snapshot["transfer_buffer_groups"],
+            "transfer_tasks": transfer_snapshot["transfer_tasks"],
             "finish_eligible_blocked_by": self._close_status(step_handle),
             "transfer_ready_groups": transfer_snapshot["ready_groups"],
+            "runtime_groups": runtime_snapshot["runtime_groups"],
+            "runtime_slots": runtime_snapshot["runtime_slots"],
+            "runtime_ready_materialized_batch_groups": runtime_snapshot["ready_materialized_batch_groups"],
+            "runtime_ready_materialized_groups": runtime_snapshot["ready_materialized_groups"],
             "previous_step_current_deficit": self._last_step_current_deficit,
+            **{key: value for key, value in reward_snapshot.items() if key.startswith("judge_")},
         }
 
     async def _wait_step_target(self, step_handle: "_AgenticStepHandle") -> None:
@@ -932,7 +1052,7 @@ class AgenticResidentPipeline:
             committed_groups = self.transfer_domain.committed_transfer_groups_snapshot()
             progress_snapshot = step_handle.progress.snapshot() if step_handle.progress is not None else {}
             get_samples_times = list(self._step_get_samples_times)
-            self.reward_domain.drop_completed_groups()
+            await self.reward_domain.drop_completed_groups()
             self.transfer_domain.release_step_output_payloads()
             if step_handle.progress is not None:
                 step_handle.progress.close()
@@ -948,6 +1068,7 @@ class AgenticResidentPipeline:
         await self.runtime_domain.trim_agentic_session_shards(reason=f"close_step_{step_handle.rollout_id}")
         async with self._dataflow_lock():
             accounting_end_snapshot = self._compact_accounting_snapshot(step_handle, phase="accounting_end")
+            reward_trace_snapshots = self.reward_domain.drain_reward_trace_snapshots()
         runtime_snapshot = self.runtime_domain.debug_snapshot()
         return _AgenticClosedStep(
             output=output,
@@ -956,6 +1077,7 @@ class AgenticResidentPipeline:
             committed_groups=committed_groups,
             progress_snapshot=progress_snapshot,
             get_samples_times=get_samples_times,
+            reward_trace_snapshots=reward_trace_snapshots,
             accounting_end_snapshot=accounting_end_snapshot,
         )
 
@@ -1039,6 +1161,11 @@ class AgenticResidentPipeline:
                     accounting_snapshot=closed_step.accounting_end_snapshot,
                 )
             )
+            append_agentic_accounting_marker(
+                args,
+                step=rollout_id,
+                snapshot=closed_step.accounting_end_snapshot,
+            )
             resident_groups = int(closed_step.accounting_end_snapshot.get("resident_group_count", 0) or 0)
             if resident_groups:
                 logger.info(
@@ -1066,9 +1193,38 @@ class AgenticResidentPipeline:
                 _aggregate_rollout_timing_from_agentic_trace(
                     samples=committed_samples,
                     get_samples_times=closed_step.get_samples_times,
+                    reward_trace_snapshots=closed_step.reward_trace_snapshots,
                 )
             )
+            if getattr(args, "use_metrics_service", False) and getattr(args, "timeline_dump_dir", None):
+                timeline_events = _build_agentic_critical_path_timeline_events(
+                    rollout_id=compute_rollout_step(args, rollout_id),
+                    samples=committed_samples,
+                    reward_trace_snapshots=closed_step.reward_trace_snapshots,
+                )
+                if timeline_events:
+                    agentic_metrics["__timeline_events__"] = timeline_events
             agentic_metrics.update(metric_gatherer.collect())
+            agentic_metrics.update(
+                {
+                    f"agentic/{key}": float(value)
+                    for key, value in closed_step.accounting_end_snapshot.items()
+                    if key.startswith("judge_")
+                }
+            )
+            append_reward_workload_markers(
+                args,
+                collection_rollout_id=rollout_id,
+                default_step=compute_rollout_step(args, rollout_id),
+                committed_samples=committed_samples,
+                reward_trace_snapshots=closed_step.reward_trace_snapshots,
+            )
+            save_reward_trace_snapshots_jsonl(
+                args,
+                rollout_id,
+                closed_step.reward_trace_snapshots,
+                committed_samples=committed_samples,
+            )
             _merge_non_conflicting_metrics(
                 agentic_metrics, compute_rollout_explicit_reward_metrics(args, committed_samples)
             )
@@ -1077,12 +1233,7 @@ class AgenticResidentPipeline:
             sglang_profile_stopped = True
             if committed_samples:
                 last_sample = committed_samples[-1]
-                logger.info(
-                    "Finish rollout: %s, label: %s, reward: %s",
-                    [str(last_sample.prompt) + last_sample.response],
-                    str(last_sample.label)[:100],
-                    last_sample.reward,
-                )
+                logger.info("Finish rollout sample summary: %s", _sample_log_summary(last_sample))
                 rollout_time = time.monotonic() - rollout_started_at
                 if args.save_debug_rollout_data is not None:
                     save_debug_rollout_data(
@@ -1169,6 +1320,7 @@ class _AgenticClosedStep:
     committed_groups: list[list[Sample]]
     progress_snapshot: dict[str, int]
     get_samples_times: list[float]
+    reward_trace_snapshots: list[dict[str, Any]]
     accounting_end_snapshot: dict[str, object]
 
 
@@ -1193,29 +1345,635 @@ class _AgenticStepHandle:
     last_idle_heartbeat_at: float = 0.0
 
 
+def _latency_statistics(values: list[float]) -> dict[str, float]:
+    array = np.asarray(values, dtype=np.float64)
+    return {
+        "mean": float(np.mean(array)),
+        "p50": float(np.percentile(array, 50)),
+        "p90": float(np.percentile(array, 90)),
+        "p95": float(np.percentile(array, 95)),
+        "p99": float(np.percentile(array, 99)),
+        "max": float(np.max(array)),
+    }
+
+
+def _append_trace_duration(
+    values: dict[str, list[float]],
+    *,
+    metric_name: str,
+    events: dict[str, Any],
+    start_key: str,
+    end_key: str,
+) -> None:
+    started_at = events.get(start_key)
+    ended_at = events.get(end_key)
+    if not isinstance(started_at, (int, float)) or not isinstance(ended_at, (int, float)):
+        return
+    if ended_at < started_at:
+        return
+    values.setdefault(metric_name, []).append(float(ended_at) - float(started_at))
+
+
+def _trace_metadata_with_reward_snapshots(
+    samples: list[Sample],
+    reward_trace_snapshots: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    trace_metadata: list[dict[str, Any]] = [
+        sample.metadata if isinstance(sample.metadata, dict) else {} for sample in samples
+    ]
+    committed_sample_keys = {
+        repr(metadata.get(TRACE_KEY, {}).get("reward", {}).get("sample_key"))
+        for metadata in trace_metadata
+        if isinstance(metadata.get(TRACE_KEY), dict)
+        and isinstance(metadata.get(TRACE_KEY, {}).get("reward"), dict)
+        and metadata.get(TRACE_KEY, {}).get("reward", {}).get("sample_key") is not None
+    }
+    for snapshot in reward_trace_snapshots or []:
+        if not isinstance(snapshot, dict):
+            continue
+        reward_trace = snapshot.get(TRACE_KEY, {}).get("reward", {})
+        snapshot_key = repr(reward_trace.get("sample_key")) if isinstance(reward_trace, dict) else None
+        if snapshot_key is not None and snapshot_key in committed_sample_keys:
+            continue
+        trace_metadata.append(snapshot)
+    return trace_metadata
+
+
+def _complete_timeline_event(
+    *,
+    name: str,
+    start_s: Any,
+    end_s: Any,
+    pid: int,
+    tid: int,
+    rollout_id: int,
+    clock_host: str | None,
+    attributes: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    if not isinstance(start_s, (int, float)) or not isinstance(end_s, (int, float)) or end_s < start_s:
+        return None
+    event_attributes = {"step": rollout_id, "clock_host": clock_host}
+    if attributes:
+        event_attributes.update(copy.deepcopy(attributes))
+    return {
+        "name": name,
+        "ph": "X",
+        "ts": int(float(start_s) * 1e6),
+        "dur": int((float(end_s) - float(start_s)) * 1e6),
+        "pid": pid,
+        "tid": tid,
+        "args": event_attributes,
+    }
+
+
+def _build_agentic_critical_path_timeline_events(
+    *,
+    rollout_id: int,
+    samples: list[Sample],
+    reward_trace_snapshots: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    timeline_events: list[dict[str, Any]] = []
+    for tid, metadata in enumerate(_trace_metadata_with_reward_snapshots(samples, reward_trace_snapshots), start=1):
+        agentic_trace = metadata.get(TRACE_KEY)
+        if not isinstance(agentic_trace, dict):
+            continue
+        reward_trace = agentic_trace.get("reward")
+        attributes = {}
+        if isinstance(reward_trace, dict):
+            attributes = {
+                "sample_key": reward_trace.get("sample_key"),
+                "group_key": reward_trace.get("group_key"),
+                "terminal_outcome": reward_trace.get("terminal_outcome"),
+                "pipeline_status": reward_trace.get("pipeline_status"),
+                "executor_status": reward_trace.get("executor_status"),
+                "executor_error_code": reward_trace.get("executor_error_code"),
+                "benchmark_mode": reward_trace.get("benchmark_mode"),
+                "group_index": reward_trace.get("group_index"),
+                "sample_index": reward_trace.get("sample_index"),
+                "context_hash": reward_trace.get("context_hash"),
+                "trajectory_hash": reward_trace.get("trajectory_hash"),
+                "recorded_reward_hash": reward_trace.get("recorded_reward_hash"),
+                "benchmark_invariant_hash": reward_trace.get("benchmark_invariant_hash"),
+                "reasoning_trigger": reward_trace.get("reasoning_trigger"),
+                "reasoning_execution_trigger": reward_trace.get("reasoning_execution_trigger"),
+                "per_turn_judge_count": reward_trace.get("per_turn_judge_count"),
+                "expected_trainer_components": reward_trace.get("expected_trainer_components"),
+                "collection_rollout_id": reward_trace.get("collection_rollout_id"),
+                "train_partition_rollout_id": reward_trace.get("train_partition_rollout_id"),
+            }
+        event_step = (
+            reward_trace.get("train_partition_step", rollout_id) if isinstance(reward_trace, dict) else rollout_id
+        )
+        trace_events = agentic_trace.get("events")
+        if isinstance(trace_events, dict):
+            for name, start_key, end_key, pid in (
+                ("critical_path.rollout_finalize", "finalize_start_at", "finalize_end_at", 2001),
+                (
+                    "critical_path.rollout_materialize_wait",
+                    "materialize_ready_at",
+                    "materialize_harvest_at",
+                    2001,
+                ),
+                (
+                    "critical_path.reward_context_build",
+                    "reward_context_build_start_at",
+                    "reward_context_build_end_at",
+                    2002,
+                ),
+                ("critical_path.reward", "reward_arrive_at", "reward_end_at", 2002),
+                (
+                    "critical_path.reward_group_finalize",
+                    "group_finalize_start_at",
+                    "group_finalize_end_at",
+                    2002,
+                ),
+                (
+                    "critical_path.transfer_buffer_wait",
+                    "transfer_buffer_enter_at",
+                    "transfer_release_start_at",
+                    2003,
+                ),
+                ("critical_path.transfer", "transfer_release_start_at", "transfer_release_end_at", 2003),
+            ):
+                event = _complete_timeline_event(
+                    name=name,
+                    start_s=trace_events.get(start_key),
+                    end_s=trace_events.get(end_key),
+                    pid=pid,
+                    tid=tid,
+                    rollout_id=event_step,
+                    clock_host=agentic_span_clock_host(trace_events, start_key, end_key),
+                    attributes=attributes,
+                )
+                if event is not None:
+                    timeline_events.append(event)
+            turn_judge_barrier_event = _complete_timeline_event(
+                name="critical_path.turn_judge_barrier",
+                start_s=trace_events.get("turn_judge_barrier_start_at"),
+                end_s=trace_events.get("turn_judge_barrier_release_at"),
+                pid=2001,
+                tid=tid,
+                rollout_id=event_step,
+                clock_host=agentic_span_clock_host(
+                    trace_events,
+                    "turn_judge_barrier_start_at",
+                    "turn_judge_barrier_release_at",
+                ),
+                attributes=attributes,
+            )
+            if turn_judge_barrier_event is not None:
+                timeline_events.append(turn_judge_barrier_event)
+            if isinstance(reward_trace, dict):
+                judges = reward_trace.get("judges")
+                for component, judge_trace in (judges if isinstance(judges, dict) else {}).items():
+                    if not isinstance(judge_trace, dict):
+                        judge_trace = {}
+                    # Sub-timings (queue_elapsed_s, http_elapsed_s, the server-reported
+                    # engine_http_elapsed_s inside `server`, ...) previously existed only
+                    # in the rollout JSONL, not the timeline -- attach them here so the
+                    # dominant cost inside a reward branch (client-side concurrency-limit
+                    # queueing, measured separately below as `.queue`) is visible without
+                    # cross-referencing the JSONL.
+                    component_attributes = {
+                        **attributes,
+                        "attempt_count": judge_trace.get("attempt_count"),
+                        "invalid_response_count": judge_trace.get("invalid_response_count"),
+                        "queue_elapsed_s": judge_trace.get("queue_elapsed_s"),
+                        "payload_prep_elapsed_s": judge_trace.get("payload_prep_elapsed_s"),
+                        "http_elapsed_s": judge_trace.get("http_elapsed_s"),
+                        "parse_elapsed_s": judge_trace.get("parse_elapsed_s"),
+                        "backoff_elapsed_s": judge_trace.get("backoff_elapsed_s"),
+                        "server": judge_trace.get("server"),
+                    }
+                    event = _complete_timeline_event(
+                        name=f"critical_path.reward.{component}",
+                        start_s=trace_events.get(f"judge_{component}_queue_enter_at"),
+                        end_s=trace_events.get(f"judge_{component}_end_at"),
+                        pid=2002,
+                        tid=tid,
+                        rollout_id=event_step,
+                        clock_host=agentic_span_clock_host(
+                            trace_events,
+                            f"judge_{component}_queue_enter_at",
+                            f"judge_{component}_end_at",
+                        ),
+                        attributes=component_attributes,
+                    )
+                    if event is not None:
+                        timeline_events.append(event)
+                    # Client-side concurrency-limit wait: a request that is fully ready
+                    # but blocked on `self._semaphores[spec.role]` in
+                    # relax/engine/rewards/dual_agentic_judge.py. Measured to be 65% of
+                    # the reward branch on the terminal_once reference run.
+                    queue_event = _complete_timeline_event(
+                        name=f"critical_path.reward.{component}.queue",
+                        start_s=trace_events.get(f"judge_{component}_queue_enter_at"),
+                        end_s=trace_events.get(f"judge_{component}_queue_acquired_at"),
+                        pid=2002,
+                        tid=tid,
+                        rollout_id=event_step,
+                        clock_host=agentic_span_clock_host(
+                            trace_events,
+                            f"judge_{component}_queue_enter_at",
+                            f"judge_{component}_queue_acquired_at",
+                        ),
+                        attributes={**attributes, "queue_elapsed_s": judge_trace.get("queue_elapsed_s")},
+                    )
+                    if queue_event is not None:
+                        timeline_events.append(queue_event)
+                    # http_start_at/http_end_at are overwritten on each retry attempt, so
+                    # this span covers only the LAST attempt, not the cumulative
+                    # http_elapsed_s (which sums every attempt); attempt_count is carried
+                    # as an attribute so a multi-attempt sample is identifiable.
+                    http_event = _complete_timeline_event(
+                        name=f"critical_path.reward.{component}.http",
+                        start_s=trace_events.get(f"judge_{component}_http_start_at"),
+                        end_s=trace_events.get(f"judge_{component}_http_end_at"),
+                        pid=2002,
+                        tid=tid,
+                        rollout_id=event_step,
+                        clock_host=agentic_span_clock_host(
+                            trace_events,
+                            f"judge_{component}_http_start_at",
+                            f"judge_{component}_http_end_at",
+                        ),
+                        attributes={
+                            **attributes,
+                            "attempt_count": judge_trace.get("attempt_count"),
+                            "server": judge_trace.get("server"),
+                        },
+                    )
+                    if http_event is not None:
+                        timeline_events.append(http_event)
+        turns = agentic_trace.get("turns")
+        for turn_index, turn in enumerate(turns if isinstance(turns, list) else []):
+            if not isinstance(turn, dict):
+                continue
+            turn_judge = turn.get("judge")
+            judge_events = turn_judge.get("events") if isinstance(turn_judge, dict) else None
+            if isinstance(judge_events, dict):
+                judge_attributes = {
+                    **attributes,
+                    "turn_index": turn_index,
+                    "judge_role": turn_judge.get("role"),
+                    "judge_status": turn_judge.get("status"),
+                    "response_state_hash": turn_judge.get("response_state_hash"),
+                    "observation_state_hash": turn_judge.get("observation_state_hash"),
+                }
+                turn_judge_event = _complete_timeline_event(
+                    name="critical_path.turn_judge",
+                    start_s=judge_events.get("turn_judge_trigger_at"),
+                    end_s=judge_events.get("turn_judge_end_at"),
+                    pid=2002,
+                    tid=tid,
+                    rollout_id=event_step,
+                    clock_host=agentic_span_clock_host(
+                        judge_events,
+                        "turn_judge_trigger_at",
+                        "turn_judge_end_at",
+                    ),
+                    attributes=judge_attributes,
+                )
+                if turn_judge_event is not None:
+                    timeline_events.append(turn_judge_event)
+            turn_events = turn.get("events")
+            if not isinstance(turn_events, dict):
+                continue
+            # `rollout_pre_generation` used to span chat_request_arrive_at ->
+            # generation_queue_enter_at as one span and was misclassified as
+            # rollout work in ad-hoc analyses (it is the largest span family in
+            # the trace: p50 0.12s but p90 107s, max 720s). It is split here
+            # along the two admission-control marks that actually exist on this
+            # path (see relax/agentic/session/service.py: ir_created_at is set
+            # in `_create_inflight_request`, ir_activated_at when
+            # `_maybe_start_next_ir_locked` pops the IR off the per-session
+            # admission gate, generation_queue_enter_at when `_run_ir` hands it
+            # toward the SGLang queue) so the genuine backpressure wait
+            # (admission_wait) is distinguishable from setup and dispatch
+            # bookkeeping around it.
+            admission_setup_event = _complete_timeline_event(
+                name="critical_path.rollout_admission_setup",
+                start_s=turn_events.get("chat_request_arrive_at"),
+                end_s=turn_events.get("ir_created_at"),
+                pid=2001,
+                tid=tid,
+                rollout_id=event_step,
+                clock_host=agentic_span_clock_host(
+                    turn_events,
+                    "chat_request_arrive_at",
+                    "ir_created_at",
+                ),
+                attributes={**attributes, "turn_index": turn_index},
+            )
+            if admission_setup_event is not None:
+                timeline_events.append(admission_setup_event)
+            admission_wait_event = _complete_timeline_event(
+                name="critical_path.rollout_admission_wait",
+                start_s=turn_events.get("ir_created_at"),
+                end_s=turn_events.get("ir_activated_at"),
+                pid=2001,
+                tid=tid,
+                rollout_id=event_step,
+                clock_host=agentic_span_clock_host(
+                    turn_events,
+                    "ir_created_at",
+                    "ir_activated_at",
+                ),
+                attributes={**attributes, "turn_index": turn_index},
+            )
+            if admission_wait_event is not None:
+                timeline_events.append(admission_wait_event)
+            dispatch_event = _complete_timeline_event(
+                name="critical_path.rollout_dispatch",
+                start_s=turn_events.get("ir_activated_at"),
+                end_s=turn_events.get("generation_queue_enter_at"),
+                pid=2001,
+                tid=tid,
+                rollout_id=event_step,
+                clock_host=agentic_span_clock_host(
+                    turn_events,
+                    "ir_activated_at",
+                    "generation_queue_enter_at",
+                ),
+                attributes={**attributes, "turn_index": turn_index},
+            )
+            if dispatch_event is not None:
+                timeline_events.append(dispatch_event)
+            queue_event = _complete_timeline_event(
+                name="critical_path.rollout_queue",
+                start_s=turn_events.get("generation_queue_enter_at"),
+                end_s=turn_events.get("generation_start_at"),
+                pid=2001,
+                tid=tid,
+                rollout_id=event_step,
+                clock_host=agentic_span_clock_host(
+                    turn_events,
+                    "generation_queue_enter_at",
+                    "generation_start_at",
+                ),
+                attributes={**attributes, "turn_index": turn_index},
+            )
+            if queue_event is not None:
+                timeline_events.append(queue_event)
+            event = _complete_timeline_event(
+                name="critical_path.rollout_generation",
+                start_s=turn_events.get("generation_start_at"),
+                end_s=turn_events.get("generation_end_at"),
+                pid=2001,
+                tid=tid,
+                rollout_id=event_step,
+                clock_host=agentic_span_clock_host(
+                    turn_events,
+                    "generation_start_at",
+                    "generation_end_at",
+                ),
+                attributes={**attributes, "turn_index": turn_index},
+            )
+            if event is not None:
+                timeline_events.append(event)
+            post_generation_event = _complete_timeline_event(
+                name="critical_path.rollout_post_generation",
+                start_s=turn_events.get("generation_end_at"),
+                end_s=turn_events.get("chat_end_at"),
+                pid=2001,
+                tid=tid,
+                rollout_id=event_step,
+                clock_host=agentic_span_clock_host(
+                    turn_events,
+                    "generation_end_at",
+                    "chat_end_at",
+                ),
+                attributes={**attributes, "turn_index": turn_index},
+            )
+            if post_generation_event is not None:
+                timeline_events.append(post_generation_event)
+            managed_session_event = _complete_timeline_event(
+                name="critical_path.rollout_managed_session",
+                start_s=turn_events.get("managed_session_runner_start_at"),
+                end_s=turn_events.get("managed_session_runner_end_at"),
+                pid=2001,
+                tid=tid,
+                rollout_id=event_step,
+                clock_host=agentic_span_clock_host(
+                    turn_events,
+                    "managed_session_runner_start_at",
+                    "managed_session_runner_end_at",
+                ),
+                attributes={**attributes, "turn_index": turn_index},
+            )
+            if managed_session_event is not None:
+                timeline_events.append(managed_session_event)
+    return timeline_events
+
+
 def _aggregate_rollout_timing_from_agentic_trace(
     *,
     samples: list[Sample],
     get_samples_times: list[float],
+    reward_trace_snapshots: list[dict[str, Any]] | None = None,
 ) -> dict[str, float]:
     generate_values: list[float] = []
     post_generate_values: list[float] = []
+    reward_metric_values: dict[str, list[float]] = {}
+    reward_status_counts: dict[tuple[str, str], int] = {}
+    turn_judge_status_counts: dict[str, int] = {}
+    group_timelines: dict[str, dict[str, list[float]]] = {}
     phase_values: dict[str, list[float]] = {
         "process_vision_info": [],
         "image_processor": [],
         "mm_encode": [],
     }
-    for sample in samples:
-        metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+    for metadata in _trace_metadata_with_reward_snapshots(samples, reward_trace_snapshots):
         agentic_trace = metadata.get(TRACE_KEY)
         if not isinstance(agentic_trace, dict):
             continue
+        trace_events = agentic_trace.get("events")
+        if not isinstance(trace_events, dict):
+            trace_events = {}
+        for metric_name, start_key, end_key in (
+            ("reward/global_queue_time", "reward_arrive_at", "reward_start_at"),
+            ("reward/sample_service_time", "reward_start_at", "reward_end_at"),
+            ("reward/sample_sojourn_time", "reward_arrive_at", "reward_end_at"),
+            ("transfer/release_time", "transfer_release_start_at", "transfer_release_end_at"),
+            ("turn_judge/barrier_time", "turn_judge_barrier_start_at", "turn_judge_barrier_release_at"),
+        ):
+            _append_trace_duration(
+                reward_metric_values,
+                metric_name=metric_name,
+                events=trace_events,
+                start_key=start_key,
+                end_key=end_key,
+            )
+
+        # A per-turn judge scores one resp->observation pair, so the final
+        # response of a trajectory is never covered by the VLM. Report the
+        # coverage explicitly rather than leaving it to be inferred.
+        judged_turns = agentic_trace.get("per_turn_judge_count")
+        assistant_turns = agentic_trace.get("per_turn_assistant_turn_count")
+        if isinstance(judged_turns, int) and isinstance(assistant_turns, int) and assistant_turns > 0:
+            reward_metric_values.setdefault("turn_judge/judged_turn_count", []).append(float(judged_turns))
+            reward_metric_values.setdefault("turn_judge/assistant_turn_count", []).append(float(assistant_turns))
+            reward_metric_values.setdefault("turn_judge/turn_coverage_ratio", []).append(
+                float(judged_turns) / float(assistant_turns)
+            )
+        off_lineage_judges = agentic_trace.get("per_turn_off_lineage_judge_count")
+        if isinstance(off_lineage_judges, int) and off_lineage_judges > 0:
+            reward_metric_values.setdefault("turn_judge/off_lineage_judge_count", []).append(float(off_lineage_judges))
+
+        reward_trace = agentic_trace.get("reward")
+        if isinstance(reward_trace, dict):
+            for field_name, metric_name in (
+                ("global_queue_elapsed_s", "reward/global_queue_monotonic_time"),
+                ("pipeline_elapsed_s", "reward/pipeline_time"),
+                ("executor_elapsed_s", "reward/executor_time"),
+                ("answer_accuracy_projection_elapsed_s", "reward/answer_accuracy/projection_time"),
+                ("multi_turn_reasoning_projection_elapsed_s", "reward/multi_turn_reasoning/projection_time"),
+            ):
+                value = reward_trace.get(field_name)
+                if isinstance(value, (int, float)):
+                    reward_metric_values.setdefault(metric_name, []).append(float(value))
+            for status_field, component in (
+                ("pipeline_status", "pipeline"),
+                ("executor_status", "executor"),
+                ("terminal_outcome", "terminal"),
+            ):
+                status = reward_trace.get(status_field)
+                if isinstance(status, str):
+                    status_key = (component, status)
+                    reward_status_counts[status_key] = reward_status_counts.get(status_key, 0) + 1
+            judges = reward_trace.get("judges")
+            if isinstance(judges, dict):
+                for component, judge_trace in judges.items():
+                    if not isinstance(component, str) or not isinstance(judge_trace, dict):
+                        continue
+                    for field_name, metric_suffix in (
+                        ("queue_elapsed_s", "queue_time"),
+                        ("payload_prep_elapsed_s", "payload_prep_time"),
+                        ("http_elapsed_s", "http_time"),
+                        ("parse_elapsed_s", "parse_time"),
+                        ("backoff_elapsed_s", "backoff_time"),
+                        ("elapsed_s", "branch_time"),
+                        ("attempt_count", "attempt_count"),
+                        ("invalid_response_count", "invalid_response_count"),
+                    ):
+                        value = judge_trace.get(field_name)
+                        if isinstance(value, (int, float)):
+                            metric_name = f"reward/{component}/{metric_suffix}"
+                            reward_metric_values.setdefault(metric_name, []).append(float(value))
+                    server_timings = judge_trace.get("server")
+                    if isinstance(server_timings, dict):
+                        for field_name, value in server_timings.items():
+                            if (
+                                not isinstance(field_name, str)
+                                or isinstance(value, bool)
+                                or not isinstance(value, (int, float))
+                            ):
+                                continue
+                            metric_name = f"reward/{component}/server/{field_name}"
+                            reward_metric_values.setdefault(metric_name, []).append(float(value))
+                        client_http = judge_trace.get("http_elapsed_s")
+                        server_total = server_timings.get("request_total_elapsed_s")
+                        if (
+                            isinstance(client_http, (int, float))
+                            and isinstance(server_total, (int, float))
+                            and client_http >= server_total
+                        ):
+                            reward_metric_values.setdefault(
+                                f"reward/{component}/client_server_residual_time", []
+                            ).append(float(client_http) - float(server_total))
+                    status = judge_trace.get("status")
+                    if isinstance(status, str):
+                        status_key = (component, status)
+                        reward_status_counts[status_key] = reward_status_counts.get(status_key, 0) + 1
+
+            group_key = reward_trace.get("group_key")
+            group_id = (
+                repr(group_key)
+                if group_key is not None
+                else f"group_index:{reward_trace.get('group_index', 'unknown')}"
+            )
+            timeline = group_timelines.setdefault(group_id, {"arrive": [], "end": [], "ready": [], "release": []})
+            for timeline_key, event_key in (
+                ("arrive", "reward_arrive_at"),
+                ("end", "reward_end_at"),
+                ("ready", "group_reward_ready_at"),
+                ("release", "transfer_release_start_at"),
+            ):
+                value = trace_events.get(event_key)
+                if isinstance(value, (int, float)):
+                    timeline[timeline_key].append(float(value))
+
         turns = agentic_trace.get("turns")
-        if not isinstance(turns, list):
-            continue
-        for turn in turns:
+        for turn in turns if isinstance(turns, list) else []:
             if not isinstance(turn, dict):
                 continue
+            turn_judge = turn.get("judge")
+            if isinstance(turn_judge, dict):
+                turn_judge_events = turn_judge.get("events")
+                if isinstance(turn_judge_events, dict):
+                    _append_trace_duration(
+                        reward_metric_values,
+                        metric_name="turn_judge/sidecar_elapsed_time",
+                        events=turn_judge_events,
+                        start_key="turn_judge_trigger_at",
+                        end_key="turn_judge_end_at",
+                    )
+                    _append_trace_duration(
+                        reward_metric_values,
+                        metric_name="turn_judge/projection_time",
+                        events=turn_judge_events,
+                        start_key="turn_judge_projection_start_at",
+                        end_key="turn_judge_projection_end_at",
+                    )
+                projection_elapsed_s = turn_judge.get("projection_elapsed_s")
+                if isinstance(projection_elapsed_s, (int, float)) and not isinstance(projection_elapsed_s, bool):
+                    reward_metric_values.setdefault("turn_judge/projection_reported_time", []).append(
+                        float(projection_elapsed_s)
+                    )
+                judge_trace = turn_judge.get("judge")
+                if isinstance(judge_trace, dict):
+                    for field_name, metric_suffix in (
+                        ("queue_elapsed_s", "queue_time"),
+                        ("payload_prep_elapsed_s", "payload_prep_time"),
+                        ("http_elapsed_s", "http_time"),
+                        ("parse_elapsed_s", "parse_time"),
+                        ("backoff_elapsed_s", "backoff_time"),
+                        ("elapsed_s", "branch_time"),
+                        ("attempt_count", "attempt_count"),
+                        ("invalid_response_count", "invalid_response_count"),
+                    ):
+                        value = judge_trace.get(field_name)
+                        if isinstance(value, (int, float)) and not isinstance(value, bool):
+                            reward_metric_values.setdefault(
+                                f"turn_judge/multi_turn_reasoning/{metric_suffix}", []
+                            ).append(float(value))
+                    server_timings = judge_trace.get("server")
+                    if isinstance(server_timings, dict):
+                        for field_name, value in server_timings.items():
+                            if (
+                                not isinstance(field_name, str)
+                                or isinstance(value, bool)
+                                or not isinstance(value, (int, float))
+                            ):
+                                continue
+                            reward_metric_values.setdefault(
+                                f"turn_judge/multi_turn_reasoning/server/{field_name}", []
+                            ).append(float(value))
+                        client_http = judge_trace.get("http_elapsed_s")
+                        server_total = server_timings.get("request_total_elapsed_s")
+                        if (
+                            isinstance(client_http, (int, float))
+                            and isinstance(server_total, (int, float))
+                            and client_http >= server_total
+                        ):
+                            reward_metric_values.setdefault(
+                                "turn_judge/multi_turn_reasoning/client_server_residual_time", []
+                            ).append(float(client_http) - float(server_total))
+                turn_judge_status = turn_judge.get("status")
+                if isinstance(turn_judge_status, str):
+                    turn_judge_status_counts[turn_judge_status] = (
+                        turn_judge_status_counts.get(turn_judge_status, 0) + 1
+                    )
             generation_elapsed_s = turn.get("generation_elapsed_s")
             wall_elapsed_s = turn.get("wall_elapsed_s")
             events = turn.get("events")
@@ -1229,6 +1987,13 @@ def _aggregate_rollout_timing_from_agentic_trace(
                 post_generate_values.append(float(wall_elapsed_s) - float(generation_elapsed_s))
             if not isinstance(events, dict):
                 continue
+            _append_trace_duration(
+                reward_metric_values,
+                metric_name="rollout/generation_queue_time",
+                events=events,
+                start_key="generation_queue_enter_at",
+                end_key="generation_start_at",
+            )
             for event_key, phase in (
                 ("process_vision_info_elapsed_s", "process_vision_info"),
                 ("processor_elapsed_s", "image_processor"),
@@ -1241,17 +2006,47 @@ def _aggregate_rollout_timing_from_agentic_trace(
     metrics: dict[str, float] = {}
     for phase, values in phase_values.items():
         if values:
-            metrics[f"perf_detail/rollout/{phase}_time/mean"] = sum(values) / len(values)
-            metrics[f"perf_detail/rollout/{phase}_time/max"] = max(values)
+            for statistic, value in _latency_statistics(values).items():
+                metrics[f"perf_detail/rollout/{phase}_time/{statistic}"] = value
     if generate_values:
-        metrics["perf_detail/rollout/generate_time/mean"] = sum(generate_values) / len(generate_values)
-        metrics["perf_detail/rollout/generate_time/max"] = max(generate_values)
+        for statistic, value in _latency_statistics(generate_values).items():
+            metrics[f"perf_detail/rollout/generate_time/{statistic}"] = value
     if post_generate_values:
-        metrics["perf_detail/rollout/post_generate_time/mean"] = sum(post_generate_values) / len(post_generate_values)
-        metrics["perf_detail/rollout/post_generate_time/max"] = max(post_generate_values)
+        for statistic, value in _latency_statistics(post_generate_values).items():
+            metrics[f"perf_detail/rollout/post_generate_time/{statistic}"] = value
     if get_samples_times:
         metrics["perf_detail/rollout/get_samples_time/total"] = sum(get_samples_times)
         metrics["perf_detail/rollout/get_samples_time/mean"] = sum(get_samples_times) / len(get_samples_times)
+    for timeline in group_timelines.values():
+        arrivals = timeline["arrive"]
+        reward_ends = timeline["end"]
+        ready_times = timeline["ready"]
+        release_times = timeline["release"]
+        if arrivals and reward_ends:
+            group_sojourn = max(reward_ends) - min(arrivals)
+            if group_sojourn >= 0:
+                reward_metric_values.setdefault("reward/group_sojourn_time", []).append(group_sojourn)
+        if len(reward_ends) > 1:
+            reward_metric_values.setdefault("reward/group_completion_spread_time", []).append(
+                max(reward_ends) - min(reward_ends)
+            )
+        if reward_ends and ready_times:
+            finalize_delay = min(ready_times) - max(reward_ends)
+            if finalize_delay >= 0:
+                reward_metric_values.setdefault("reward/group_finalize_delay_time", []).append(finalize_delay)
+        if ready_times and release_times:
+            release_delay = min(release_times) - max(ready_times)
+            if release_delay >= 0:
+                reward_metric_values.setdefault("transfer/reward_ready_to_release_time", []).append(release_delay)
+    for metric_name, values in reward_metric_values.items():
+        if not values:
+            continue
+        for statistic, value in _latency_statistics(values).items():
+            metrics[f"perf_detail/{metric_name}/{statistic}"] = value
+    for (component, status), count in reward_status_counts.items():
+        metrics[f"perf_detail/reward/{component}/status/{status}_count"] = float(count)
+    for status, count in turn_judge_status_counts.items():
+        metrics[f"perf_detail/turn_judge/status/{status}_count"] = float(count)
     return metrics
 
 
@@ -1372,7 +2167,13 @@ def _compute_rollout_perf_metrics_from_samples(args, samples: list[Sample], roll
     return log_dict
 
 
-def _log_rollout_data(rollout_id, args, samples, rollout_extra_metrics, rollout_time) -> None:
+def _log_rollout_data(
+    rollout_id,
+    args,
+    samples,
+    rollout_extra_metrics,
+    rollout_time,
+) -> None:
     from relax.utils import tracking_utils
 
     save_rollout_result_jsonl(args, rollout_id, samples)
@@ -1394,6 +2195,11 @@ def _log_rollout_data(rollout_id, args, samples, rollout_extra_metrics, rollout_
     step = compute_rollout_step(args, rollout_id)
     log_dict["rollout/step"] = step
     tracking_utils.log(args, log_dict, step_key="rollout/step")
+    # Agentic rollout and trainer report the same logical step from different
+    # processes. Flush here as well as on the trainer so late rollout/reward
+    # events, especially from the final step, cannot remain stranded in the
+    # MetricsService timeline buffer with no later report trigger.
+    tracking_utils.flush_metrics(args, step)
 
 
 def _load_eval_dataset(args, dataset_cfg: EvalDatasetConfig):

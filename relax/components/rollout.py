@@ -428,6 +428,11 @@ class Rollout(Base):
                     if (
                         local_step == self.config.num_rollout
                         and getattr(self.config, "fully_async", False)
+                        # debug-rollout-only clears each train_* partition as soon as it
+                        # has been logged (see relax/agentic/rollout.py), so the final
+                        # partition always reads as incomplete here. Backfilling it would
+                        # start a step against an already-disposed resident pipeline.
+                        and not self.config.debug_rollout_only
                         and not await self._async_check_partition_production_complete(final_partition_id)
                     ):
                         self._logger.warning(

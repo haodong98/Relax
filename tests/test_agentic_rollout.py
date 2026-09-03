@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from collections import deque
 from types import SimpleNamespace
 from typing import Any
@@ -51,6 +52,7 @@ def _runtime_args(**overrides):
         "partial_rollout": False,
         "fully_async": False,
         "max_staleness": 0,
+        "wandb_always_use_train_step": False,
         "colocate": True,
         "global_batch_size": 2,
         "num_iters_per_train_update": 1,
@@ -194,6 +196,7 @@ def _make_chat_test_shard(
         session_seed={"prompt": "hello", "metadata": {"template_kwargs": {}}},
         session_sampling_params=session_sampling_params or {"max_new_tokens": 8},
         resp_state_hash_by_request_id={},
+        turn_index_by_response_hash={},
         irs_by_id={},
         ir_queue=deque(),
         active_ir_runner_tasks={},
@@ -412,6 +415,62 @@ def test_chat_request_validation_context_limit_and_logprob_payload() -> None:
     payload = asyncio.run(_run())
     assert payload["_http_status"] == 400
     assert record.pending_chat_waiters == record.irs_by_id == record.active_ir_runner_tasks == {}
+
+
+def test_per_turn_judge_cancellation_releases_completed_context(monkeypatch) -> None:
+    """A cancellation during thread-backed context build must not retain
+    media."""
+    shard_cls = AgenticSessionShard.__ray_metadata__.modified_class
+    shard = SimpleNamespace(args=SimpleNamespace())
+    entered = threading.Event()
+    finish = threading.Event()
+
+    class _Context:
+        released = False
+
+        def release(self) -> None:
+            self.released = True
+
+    context = _Context()
+
+    def build_context(**_kwargs):
+        entered.set()
+        assert finish.wait(timeout=1)
+        return context
+
+    monkeypatch.setattr("relax.agentic.session.reward_context.build_turn_judge_context", build_context)
+    initial = SimpleNamespace(state_hash="initial")
+    response = SimpleNamespace(state_hash="response")
+    observation = SimpleNamespace(state_hash="observation")
+
+    async def run_case() -> None:
+        task = asyncio.create_task(
+            shard_cls._run_per_turn_judge(
+                shard,
+                initial_node=initial,
+                response_node=response,
+                observation_node=observation,
+                session_id="session",
+                group_index=0,
+                sample_index=0,
+                turn_index=0,
+                static_metadata={},
+                tools=[],
+                triggered_at=0.0,
+            )
+        )
+        for _ in range(100):
+            if entered.is_set():
+                break
+            await asyncio.sleep(0.001)
+        assert entered.is_set()
+        task.cancel()
+        finish.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(run_case())
+    assert context.released is True
 
 
 @pytest.mark.parametrize(
@@ -675,3 +734,253 @@ def test_deficit_quota_keeps_admission_ledger_consistent() -> None:
     assert remaining_previous_debt == 1  # only the genuine deficit is debt
     assert resident_current_window_groups == 2  # the 2 surplus folded into current window
     assert current_window_slack >= 0
+
+
+def _per_turn_branching_forest():
+    """Build a forest where an agent trimmed history and branched.
+
+    ``_match_parent_state_hash`` matches the longest existing message prefix,
+    including interior nodes, so an agent that replays a shorter prefix
+    continues from ``r0`` again and abandons the ``o0_a`` branch.
+    """
+    forest, initial_obs = _forest_with_initial_obs(
+        session_id="sess-branch",
+        messages=[{"role": "user", "content": [{"type": "text", "text": "task"}]}],
+        train_token_delta=_chars("task"),
+        rollout_token_delta=_chars("task"),
+        group_index=0,
+        index=0,
+    )
+    first_response = forest.append_resp(
+        parent_state_hash=initial_obs.state_hash,
+        rollout_id=0,
+        abort_count=0,
+        messages_delta=[{"role": "assistant", "content": [{"type": "text", "text": "act0"}]}],
+        train_token_delta=_chars("act0"),
+        rollout_token_delta=_chars("act0"),
+        logprob_delta=[-0.1] * len(_chars("act0")),
+        status="completed",
+    )
+    # Abandoned branch: this observation is judged but never reaches the leaf.
+    abandoned_obs = forest.append_obs(
+        parent_state_hash=first_response.state_hash,
+        rollout_id=0,
+        abort_count=0,
+        messages_delta=[{"role": "tool", "content": [{"type": "text", "text": "abandoned"}]}],
+        train_token_delta=_chars("abandoned"),
+        rollout_token_delta=_chars("abandoned"),
+    )
+    # Kept branch from the same response node.
+    kept_obs = forest.append_obs(
+        parent_state_hash=first_response.state_hash,
+        rollout_id=0,
+        abort_count=0,
+        messages_delta=[{"role": "tool", "content": [{"type": "text", "text": "kept"}]}],
+        train_token_delta=_chars("kept"),
+        rollout_token_delta=_chars("kept"),
+    )
+    leaf = forest.append_resp(
+        parent_state_hash=kept_obs.state_hash,
+        rollout_id=0,
+        abort_count=0,
+        messages_delta=[{"role": "assistant", "content": [{"type": "text", "text": "final"}]}],
+        train_token_delta=_chars("final"),
+        rollout_token_delta=_chars("final"),
+        logprob_delta=[-0.1] * len(_chars("final")),
+        status="completed",
+    )
+    return forest, first_response, abandoned_obs, kept_obs, leaf
+
+
+def test_per_turn_judgements_are_filtered_to_the_exported_lineage() -> None:
+    """An abandoned branch's judgement must not reach the reward or the count.
+
+    Averaging an off-lineage interaction into ``multi_turn_reasoning`` would
+    train on a score for an interaction the exported trajectory never took.
+    """
+    forest, first_response, abandoned_obs, _kept_obs, leaf = _per_turn_branching_forest()
+    on_lineage = {
+        "response_state_hash": first_response.state_hash,
+        "observation_state_hash": _kept_obs.state_hash,
+        "turn_index": 0,
+        "role": "judge_multiturn_vlm",
+        "status": "success",
+        "score": 1.0,
+    }
+    off_lineage = {
+        # Same response node, but the observation belongs to the dead branch.
+        "response_state_hash": "resp-only-on-abandoned-branch",
+        "observation_state_hash": abandoned_obs.state_hash,
+        "turn_index": 0,
+        "role": "judge_multiturn_vlm",
+        "status": "success",
+        "score": 0.0,
+    }
+
+    sample = forest.build_sample(
+        leaf_state_hash=leaf.state_hash,
+        tokenizer=_FakeTokenizer(),
+        include_reward_context=True,
+        reward_context_kind="per_turn",
+        per_turn_judgements=[on_lineage, off_lineage],
+    )
+
+    trace = sample.metadata["agentic_trace"]
+    assert trace["per_turn_judge_count"] == 1
+    assert trace["per_turn_off_lineage_judge_count"] == 1
+    scored = [item["score"] for item in sample.reward_context.per_turn_judgements]
+    assert scored == [1.0]
+    assert sample.reward_context.per_turn_fallback_terminal_once is False
+
+
+def test_per_turn_all_judgements_off_lineage_uses_terminal_fallback() -> None:
+    """Zero *usable* interactions must take the documented terminal fallback.
+
+    Without the lineage filter this reached the aggregator with an off-lineage
+    outcome instead; with it, the trajectory has no scored interaction of its
+    own and must fall back rather than invent one.
+    """
+    forest, _first_response, abandoned_obs, _kept_obs, leaf = _per_turn_branching_forest()
+    off_lineage = {
+        "response_state_hash": "resp-only-on-abandoned-branch",
+        "observation_state_hash": abandoned_obs.state_hash,
+        "turn_index": 0,
+        "role": "judge_multiturn_vlm",
+        "status": "success",
+        "score": 0.0,
+    }
+
+    sample = forest.build_sample(
+        leaf_state_hash=leaf.state_hash,
+        tokenizer=_FakeTokenizer(),
+        include_reward_context=True,
+        reward_context_kind="per_turn",
+        per_turn_judgements=[off_lineage],
+    )
+
+    trace = sample.metadata["agentic_trace"]
+    assert trace["per_turn_judge_count"] == 0
+    assert trace["per_turn_off_lineage_judge_count"] == 1
+    assert sample.reward_context.per_turn_fallback_terminal_once is True
+    assert sample.reward_context.per_turn_judgements == []
+
+
+def test_per_turn_trace_reports_final_response_is_not_vlm_covered() -> None:
+    """The trailing response has no observation, so it is accuracy-only.
+
+    Terminal-once *does* read it, so the exported counts must make that
+    coverage difference explicit rather than leaving it to be inferred.
+    """
+    forest, first_response, _abandoned_obs, kept_obs, leaf = _per_turn_branching_forest()
+    judgement = {
+        "response_state_hash": first_response.state_hash,
+        "observation_state_hash": kept_obs.state_hash,
+        "turn_index": 0,
+        "role": "judge_multiturn_vlm",
+        "status": "success",
+        "score": 0.75,
+    }
+
+    sample = forest.build_sample(
+        leaf_state_hash=leaf.state_hash,
+        tokenizer=_FakeTokenizer(),
+        include_reward_context=True,
+        reward_context_kind="per_turn",
+        per_turn_judgements=[judgement],
+    )
+
+    trace = sample.metadata["agentic_trace"]
+    # Two assistant turns on the lineage, only the first has a following
+    # observation and therefore a per-turn judge.
+    assert trace["per_turn_assistant_turn_count"] == 2
+    assert trace["per_turn_judge_count"] == 1
+    assert "per_turn_off_lineage_judge_count" not in trace
+
+
+def test_per_turn_barrier_timeout_cancels_stragglers_and_records_them() -> None:
+    """A wedged Judge must not hold the session lock for its full retry bound.
+
+    Each call is already bounded by ``timeout_s * max_attempts``, but per_turn
+    has ~T times more calls in flight, so the terminal join needs its own
+    ceiling. Timed-out work is recorded as a ``barrier_timeout`` rejection so
+    it flows through the ordinary sample-rejection path.
+    """
+    shard_cls = AgenticSessionShard.__ray_metadata__.modified_class
+    shard = SimpleNamespace(args=SimpleNamespace(judge_services=SimpleNamespace(turn_judge_barrier_timeout_s=0.05)))
+
+    async def run_case():
+        async def quick() -> dict:
+            return {
+                "observation_state_hash": "obs-fast",
+                "turn_index": 0,
+                "status": "success",
+                "score": 1.0,
+            }
+
+        async def wedged() -> dict:
+            await asyncio.sleep(30)
+            raise AssertionError("wedged judge should have been cancelled by the barrier")
+
+        record = SimpleNamespace(
+            per_turn_judge_tasks={
+                "obs-fast": asyncio.create_task(quick()),
+                "obs-wedged": asyncio.create_task(wedged()),
+            },
+            forest=SimpleNamespace(session_id="sess-barrier"),
+        )
+        return await shard_cls._await_per_turn_judges_locked(shard, record)
+
+    outcomes, barrier_events = asyncio.run(run_case())
+
+    assert barrier_events["turn_judge_barrier_timed_out"] is True
+    assert "turn_judge_barrier_start_at" in barrier_events
+    assert "turn_judge_barrier_release_at" in barrier_events
+    by_hash = {item["observation_state_hash"]: item for item in outcomes}
+    assert by_hash["obs-fast"]["status"] == "success"
+    assert by_hash["obs-wedged"]["status"] == "rejected"
+    assert by_hash["obs-wedged"]["error_code"] == "barrier_timeout"
+
+
+def test_per_turn_barrier_without_timeout_waits_for_all_judges() -> None:
+    """``turn_judge_barrier_timeout_s`` unset keeps the per-call bounds
+    only."""
+    shard_cls = AgenticSessionShard.__ray_metadata__.modified_class
+    shard = SimpleNamespace(args=SimpleNamespace(judge_services=SimpleNamespace()))
+
+    async def run_case():
+        async def slow_but_finite() -> dict:
+            await asyncio.sleep(0.02)
+            return {"observation_state_hash": "obs-slow", "turn_index": 0, "status": "success", "score": 0.5}
+
+        record = SimpleNamespace(
+            per_turn_judge_tasks={"obs-slow": asyncio.create_task(slow_but_finite())},
+            forest=SimpleNamespace(session_id="sess-nobarrier"),
+        )
+        return await shard_cls._await_per_turn_judges_locked(shard, record)
+
+    outcomes, barrier_events = asyncio.run(run_case())
+
+    assert "turn_judge_barrier_timed_out" not in barrier_events
+    assert [item["status"] for item in outcomes] == ["success"]
+
+
+def test_per_turn_barrier_records_already_completed_sidecars() -> None:
+    shard_cls = AgenticSessionShard.__ray_metadata__.modified_class
+    shard = SimpleNamespace(args=SimpleNamespace(judge_services=SimpleNamespace(turn_judge_barrier_timeout_s=1.0)))
+
+    async def run_case():
+        async def quick() -> dict:
+            return {"observation_state_hash": "obs-ready", "turn_index": 0, "status": "success", "score": 0.5}
+
+        task = asyncio.create_task(quick())
+        await task
+        record = SimpleNamespace(
+            per_turn_judge_tasks={"obs-ready": task},
+            forest=SimpleNamespace(session_id="sess-ready"),
+        )
+        return await shard_cls._await_per_turn_judges_locked(shard, record)
+
+    outcomes, barrier_events = asyncio.run(run_case())
+
+    assert [item["status"] for item in outcomes] == ["success"]
+    assert barrier_events["turn_judge_barrier_release_at"] >= barrier_events["turn_judge_barrier_start_at"]

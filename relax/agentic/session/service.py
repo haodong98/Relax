@@ -65,6 +65,35 @@ _AGENTIC_SHARD_ALLOCATOR_ENV = {
 }
 
 
+def _copy_training_multimodal_inputs(
+    multimodal_train_inputs: dict[str, Any] | None,
+    *,
+    use_bf16: bool,
+) -> dict[str, Any] | None:
+    """Copy train-only media tensors, compacting Qwen-style pixels before
+    transport.
+
+    Megatron-Bridge casts Qwen-VL ``pixel_values`` to bfloat16 before the
+    vision patch embedding. Doing that deterministic cast while the session
+    artifact is built avoids retaining and transferring an equivalent float32
+    copy (hundreds of MB per MobileGym trajectory).
+    """
+    if multimodal_train_inputs is None:
+        return None
+    if not use_bf16:
+        return copy.deepcopy(multimodal_train_inputs)
+
+    import torch
+
+    copied: dict[str, Any] = {}
+    for key, value in multimodal_train_inputs.items():
+        if key in {"pixel_values", "pixel_values_videos"} and isinstance(value, torch.Tensor):
+            copied[key] = value.to(dtype=torch.bfloat16) if value.is_floating_point() else value.clone()
+        else:
+            copied[key] = copy.deepcopy(value)
+    return copied
+
+
 def _resolve_fastapi_request_endpoint(func: Callable[..., Any]) -> Callable[..., Any]:
     # Ray Serve registers this class-bound route while FastAPI inspects its signature.
     # Resolve postponed annotations first so FastAPI 0.139 injects Request instead of
@@ -149,6 +178,8 @@ class _SessionRecord:
     session_sampling_params: dict[str, Any] = field(default_factory=dict)
     session_seed: dict[str, Any] = field(default_factory=dict)
     resp_state_hash_by_request_id: dict[str, str] = field(default_factory=dict)
+    turn_index_by_response_hash: dict[str, int] = field(default_factory=dict)
+    per_turn_judge_tasks: dict[str, asyncio.Task[dict[str, Any]]] = field(default_factory=dict)
     irs_by_id: dict[str, InflightRequest] = field(default_factory=dict)
     ir_queue: deque[str] = field(default_factory=deque)
     active_ir_runner_tasks: dict[str, asyncio.Task[Any]] = field(default_factory=dict)
@@ -1182,7 +1213,10 @@ class AgenticSessionShard:
             messages_delta=messages,
             train_token_delta=list(encoded.train_prompt_ids),
             rollout_token_delta=list(encoded.backend_prompt_ids),
-            multimodal_train_inputs_delta=copy.deepcopy(encoded.multimodal_train_inputs),
+            multimodal_train_inputs_delta=_copy_training_multimodal_inputs(
+                encoded.multimodal_train_inputs,
+                use_bf16=bool(getattr(self.args, "bf16", False)),
+            ),
             backend_image_data_delta=list(encoded.backend_image_data),
             backend_audio_data_delta=list(encoded.backend_audio_data),
             backend_video_data_delta=list(encoded.backend_video_data),
@@ -1241,7 +1275,10 @@ class AgenticSessionShard:
             messages_delta=obs_delta,
             train_token_delta=list(encoded_obs.train_prompt_ids),
             rollout_token_delta=list(encoded_obs.backend_prompt_ids),
-            multimodal_train_inputs_delta=copy.deepcopy(encoded_obs.multimodal_train_inputs),
+            multimodal_train_inputs_delta=_copy_training_multimodal_inputs(
+                encoded_obs.multimodal_train_inputs,
+                use_bf16=bool(getattr(self.args, "bf16", False)),
+            ),
             backend_image_data_delta=list(encoded_obs.backend_image_data),
             backend_audio_data_delta=list(encoded_obs.backend_audio_data),
             backend_video_data_delta=list(encoded_obs.backend_video_data),
@@ -1249,6 +1286,220 @@ class AgenticSessionShard:
             chat_template_kwargs=None,
         )
         return obs_node.state_hash, dict(encoded_obs.timing)
+
+    def _per_turn_reasoning_enabled(self) -> bool:
+        judge_services = getattr(self.args, "judge_services", None)
+        if getattr(self.args, "rm_type", None) != "dual-agentic-judge" or judge_services is None:
+            return False
+        return getattr(judge_services, "reasoning_trigger", "terminal_once") == "per_turn" and getattr(
+            judge_services, "benchmark_mode", "dual"
+        ) in {"dual", "dual_shadow"}
+
+    async def _run_per_turn_judge(
+        self,
+        *,
+        initial_node: Any,
+        response_node: Any,
+        observation_node: Any,
+        session_id: str,
+        group_index: int | None,
+        sample_index: int | None,
+        turn_index: int,
+        static_metadata: dict[str, Any],
+        tools: list[dict[str, Any]],
+        triggered_at: float,
+    ) -> dict[str, Any]:
+        """Build and score one immutable interaction snapshot off the chat
+        lock."""
+        events: dict[str, Any] = {}
+        mark_agentic_event(events, "turn_judge_trigger_at", triggered_at)
+        outcome_base = {
+            "response_state_hash": response_node.state_hash,
+            "observation_state_hash": observation_node.state_hash,
+            "turn_index": turn_index,
+            "role": "judge_multiturn_vlm",
+            "events": events,
+        }
+        context = None
+        try:
+            from relax.agentic.session.reward_context import RewardContextError, build_turn_judge_context
+
+            loop = asyncio.get_running_loop()
+            context_future = loop.run_in_executor(
+                None,
+                lambda: build_turn_judge_context(
+                    session_id=session_id,
+                    group_index=group_index,
+                    sample_index=sample_index,
+                    initial_node=initial_node,
+                    response_node=response_node,
+                    observation_node=observation_node,
+                    turn_index=turn_index,
+                    static_metadata=static_metadata,
+                    tools=tools,
+                ),
+            )
+            try:
+                context = await asyncio.shield(context_future)
+            except asyncio.CancelledError:
+                # Context construction may still be decoding media in a worker
+                # thread. Wait before its local references are discarded.  A
+                # completed context is otherwise orphaned here because this
+                # task never hands it to ``score_turn_reasoning`` (which
+                # normally owns ``context.release()`` in its ``finally``).
+                abandoned_context = await context_future
+                release = getattr(abandoned_context, "release", None)
+                if callable(release):
+                    release()
+                raise
+            from relax.engine.rewards.dual_agentic_judge import async_compute_turn_reasoning
+
+            return await async_compute_turn_reasoning(self.args, context=context, outcome_base=outcome_base)
+        except asyncio.CancelledError:
+            raise
+        except RewardContextError as exc:
+            mark_agentic_event(events, "turn_judge_end_at")
+            return {
+                **outcome_base,
+                "status": "rejected",
+                "error_code": exc.code,
+                "error_message": str(exc),
+            }
+        except Exception as exc:
+            mark_agentic_event(events, "turn_judge_end_at")
+            logger.exception(
+                "Per-turn judge setup failed for session_id=%s response=%s observation=%s",
+                session_id,
+                response_node.state_hash,
+                observation_node.state_hash,
+            )
+            return {
+                **outcome_base,
+                "status": "error",
+                "error_code": type(exc).__name__,
+                "error_message": str(exc)[:512],
+                "systemic": True,
+            }
+
+    def _schedule_per_turn_judge_locked(
+        self,
+        *,
+        record: _SessionRecord,
+        observation_state_hash: str,
+    ) -> None:
+        if not self._per_turn_reasoning_enabled():
+            return
+        if observation_state_hash in record.per_turn_judge_tasks:
+            return
+        forest = record.forest
+        if forest is None:
+            return
+        observation_node = forest.nodes_by_hash.get(observation_state_hash)
+        if observation_node is None or observation_node.kind != "obs":
+            return
+        response_node = forest.nodes_by_hash.get(observation_node.parent_state_hash)
+        if response_node is None or response_node.kind != "resp":
+            return
+        initial_node = forest.subtree_root_node(response_node.state_hash)
+        if initial_node is None or initial_node.kind != "obs":
+            return
+        turn_index = record.turn_index_by_response_hash.get(response_node.state_hash)
+        if turn_index is None:
+            logger.warning(
+                "Skipping per-turn judge with no response turn index for session_id=%s response=%s",
+                forest.session_id,
+                response_node.state_hash,
+            )
+            return
+        task = asyncio.create_task(
+            self._run_per_turn_judge(
+                initial_node=copy.deepcopy(initial_node),
+                response_node=copy.deepcopy(response_node),
+                observation_node=copy.deepcopy(observation_node),
+                session_id=forest.session_id,
+                group_index=forest.group_index,
+                sample_index=forest.index,
+                turn_index=turn_index,
+                static_metadata=copy.deepcopy(forest.static_metadata),
+                tools=forest.subtree_tools(response_node.state_hash),
+                triggered_at=time.time(),
+            )
+        )
+        record.per_turn_judge_tasks[observation_state_hash] = task
+
+    async def _await_per_turn_judges_locked(
+        self,
+        record: _SessionRecord,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Join sidecar VLM work at terminal materialization only.
+
+        The judge tasks never touch ``record`` after creation, so awaiting them
+        under the session lock prevents a final/discard race without
+        serializing ordinary subsequent agent turns behind VLM inference.
+        """
+        task_items = list(record.per_turn_judge_tasks.items())
+        if not task_items:
+            return [], {}
+        barrier_events: dict[str, Any] = {}
+        # Record the terminal join even when every sidecar has already
+        # completed.  In that common overlap case the residual is zero, but
+        # the trace must distinguish an observed zero-residual barrier from
+        # missing barrier provenance.
+        mark_agentic_event(barrier_events, "turn_judge_barrier_start_at")
+        tasks = [task for _, task in task_items]
+        timeout_s = getattr(getattr(self.args, "judge_services", None), "turn_judge_barrier_timeout_s", None)
+        gather_future = asyncio.gather(*tasks, return_exceptions=True)
+        timed_out = False
+        try:
+            # ``shield`` so a barrier timeout cancels only the stragglers below
+            # and never leaves a half-joined gather owning live tasks.
+            results = await asyncio.wait_for(asyncio.shield(gather_future), timeout=timeout_s)
+        except asyncio.TimeoutError:
+            timed_out = True
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            results = await gather_future
+            logger.warning(
+                "Per-turn judge barrier timed out after %ss for session_id=%s; "
+                "cancelled stragglers are recorded as barrier_timeout rejections",
+                timeout_s,
+                record.forest.session_id if record.forest is not None else "<unknown>",
+            )
+        mark_agentic_event(barrier_events, "turn_judge_barrier_release_at")
+        if timed_out:
+            barrier_events["turn_judge_barrier_timed_out"] = True
+        record.per_turn_judge_tasks.clear()
+        outcomes: list[dict[str, Any]] = []
+        for (observation_state_hash, _task), result in zip(task_items, results, strict=True):
+            if isinstance(result, asyncio.CancelledError):
+                outcomes.append(
+                    {
+                        "observation_state_hash": observation_state_hash,
+                        "status": "rejected",
+                        # A cancellation observed here can only come from the
+                        # barrier timeout above; ordinary discards cancel these
+                        # tasks outside the barrier and never read the results.
+                        "error_code": "barrier_timeout" if timed_out else "cancelled",
+                        "role": "judge_multiturn_vlm",
+                    }
+                )
+                continue
+            if isinstance(result, BaseException):
+                outcomes.append(
+                    {
+                        "observation_state_hash": observation_state_hash,
+                        "status": "error",
+                        "error_code": type(result).__name__,
+                        "role": "judge_multiturn_vlm",
+                        "systemic": True,
+                    }
+                )
+                continue
+            if isinstance(result, dict):
+                outcomes.append(result)
+        outcomes.sort(key=lambda item: int(item.get("turn_index", -1)))
+        return outcomes, barrier_events
 
     def _default_sampling_params(self, *, sample_index: int | None) -> dict[str, Any]:
         sampling_params: dict[str, Any] = {
@@ -1345,6 +1596,8 @@ class AgenticSessionShard:
         record.session_sampling_params.clear()
         record.session_seed.clear()
         record.resp_state_hash_by_request_id.clear()
+        record.turn_index_by_response_hash.clear()
+        record.per_turn_judge_tasks.clear()
         record.irs_by_id.clear()
         record.ir_queue.clear()
         record.active_ir_runner_tasks.clear()
@@ -1657,6 +1910,8 @@ class AgenticSessionShard:
             export_metadata_patch=ir.pending_export_metadata_patch,
         )
         record.resp_state_hash_by_request_id[ir.request_id] = resp_node.state_hash
+        if resp_node.state_hash not in record.turn_index_by_response_hash:
+            record.turn_index_by_response_hash[resp_node.state_hash] = len(record.turn_index_by_response_hash)
         resp_profile = agentic_trace_events(resp_node.export_metadata_patch)
         prompt_tokens = int(ir.latest_backend_meta.get("prompt_tokens", 0) or 0)
         usage = {
@@ -2045,6 +2300,8 @@ class AgenticSessionShard:
         reward: float | dict[str, Any] | None,
         metadata: dict[str, Any] | None,
         mutate_node: bool,
+        per_turn_judgements: list[dict[str, Any]] | None = None,
+        per_turn_barrier_events: dict[str, Any] | None = None,
     ):
         if state_hash not in record.forest.nodes_by_hash:
             raise _NonFinalizableExportError("unknown_state_hash")
@@ -2061,9 +2318,22 @@ class AgenticSessionShard:
                 node.reward = copy.deepcopy(reward)
             if metadata_patch:
                 node.export_metadata_patch.update(metadata_patch)
+        judge_services = getattr(self.args, "judge_services", None)
+        benchmark_mode = getattr(judge_services, "benchmark_mode", "dual")
+        reasoning_trigger = getattr(judge_services, "reasoning_trigger", "terminal_once")
+        if benchmark_mode in {"dual", "dual_shadow"} and reasoning_trigger == "per_turn":
+            reward_context_kind = "per_turn"
+        elif benchmark_mode in {"dual", "dual_shadow"}:
+            reward_context_kind = "trajectory"
+        else:
+            reward_context_kind = "accuracy"
         sample = record.forest.build_sample(
             leaf_state_hash=state_hash,
             tokenizer=self.backend.tokenizer,
+            include_reward_context=getattr(self.args, "rm_type", None) == "dual-agentic-judge",
+            reward_context_kind=reward_context_kind,
+            per_turn_judgements=per_turn_judgements,
+            per_turn_barrier_events=per_turn_barrier_events,
             # mask_offpolicy_in_partial_rollout=bool(
             #     self.args.partial_rollout and self.args.mask_offpolicy_in_partial_rollout
             # ),
@@ -2076,19 +2346,52 @@ class AgenticSessionShard:
         mark_metadata_agentic_event(sample.metadata, "finalize_end_at", finalize_ended_at)
         return sample
 
-    def _implicit_export_state_hash(self, record: _SessionRecord) -> str:
+    def _implicit_export_leaf_hashes(self, record: _SessionRecord) -> list[str]:
+        """Every leaf whose lineage committed a response, in node-creation
+        order.
+
+        A session grows more than one exportable leaf whenever the agent
+        *rewrites* conversation history instead of appending to it -- e.g. a GUI
+        agent that keeps only the current screenshot inline and drops the images
+        from earlier turns. Each such turn no longer extends the previously
+        committed prefix, so the forest roots it as its own branch. Those
+        branches are real, individually valid trajectories, each holding the
+        exact context the policy saw plus the response it produced. Returning
+        all of them keeps that visible to callers; the caller decides which to
+        export (today: the last, see ``_build_transport_from_output``).
+
+        Leaves are ordered by walking ``nodes_by_hash`` (insertion-ordered, so
+        chronological) rather than ``export_leaf_hashes()``, whose backing set
+        iterates in a per-process, hash-seed-dependent order. That ordering is
+        what makes "the last branch" mean the newest one rather than an
+        arbitrary one that changes between runs.
+        """
         if record.forest is None:
             raise _NonFinalizableExportError("no_committed_response")
+        leaf_hashes = set(record.forest.export_leaf_hashes())
         exportable_leaf_hashes = []
-        for leaf_hash in record.forest.export_leaf_hashes():
-            lineage = record.forest.lineage(leaf_hash)
+        for state_hash in record.forest.nodes_by_hash:
+            if state_hash not in leaf_hashes:
+                continue
+            lineage = record.forest.lineage(state_hash)
             if any(node.kind == "resp" for node in lineage):
-                exportable_leaf_hashes.append(leaf_hash)
+                exportable_leaf_hashes.append(state_hash)
         if not exportable_leaf_hashes:
             raise _NonFinalizableExportError("no_committed_response")
-        if len(exportable_leaf_hashes) != 1:
-            raise _NonFinalizableExportError("multiple_exportable_leaves")
-        return exportable_leaf_hashes[0]
+        if len(exportable_leaf_hashes) > 1:
+            # An agent that appends to its history yields exactly one branch. More
+            # than one means some turn rewrote the prefix, and only the last branch
+            # survives export -- silently dropping the other turns' tokens, their
+            # screenshots (so a terminal judge sees one observation instead of all
+            # of them) and their per-turn judgements. Loud, because the pipeline
+            # otherwise keeps running and only the reward quality degrades.
+            logger.warning(
+                "Session %s finalized with %d exportable branches; exporting the newest only. "
+                "The agent rewrote conversation history instead of appending to it.",
+                record.forest.session_id,
+                len(exportable_leaf_hashes),
+            )
+        return exportable_leaf_hashes
 
     def _explicit_export_state_hash(self, record: _SessionRecord, output_record: dict[str, Any]) -> str:
         if record.forest is None:
@@ -2150,6 +2453,8 @@ class AgenticSessionShard:
         output_records: list[dict[str, Any]] | None,
         finalize_arrive_at: float,
         finalize_lock_acquired_at: float,
+        per_turn_judgements: list[dict[str, Any]] | None = None,
+        per_turn_barrier_events: dict[str, Any] | None = None,
     ) -> FinalizedResultTransport:
         records = output_records or []
         if records:
@@ -2159,6 +2464,7 @@ class AgenticSessionShard:
                 node = record.forest.nodes_by_hash.get(state_hash)
                 if node is not None:
                     profile = agentic_trace_events(node.export_metadata_patch)
+                    mark_agentic_event(profile, "session_terminal_admission_at", finalize_arrive_at)
                     mark_agentic_event(profile, "finalize_arrive_at", finalize_arrive_at)
                     mark_agentic_event(profile, "finalize_lock_acquired_at", finalize_lock_acquired_at)
                 sample = self._build_sample_from_state_hash(
@@ -2167,6 +2473,8 @@ class AgenticSessionShard:
                     reward=output_record.get("reward"),
                     metadata=output_record.get("metadata"),
                     mutate_node=False,
+                    per_turn_judgements=per_turn_judgements,
+                    per_turn_barrier_events=per_turn_barrier_events,
                 )
                 unit_payloads.append(
                     self._unit_payload(
@@ -2177,10 +2485,21 @@ class AgenticSessionShard:
                 )
             return self._build_transport_from_unit_payloads(unit_payloads)
 
-        leaf_hash = self._implicit_export_state_hash(record)
+        # Export the newest branch only, so a session always contributes exactly
+        # one sample. The data plane is sized and grouped on that invariant --
+        # TransferQueue capacity is rollout_batch_size * (max_staleness + 1) *
+        # n_samples_per_prompt and GRPOGroupNSampler forms groups of
+        # n_samples_per_prompt (both in relax/core/controller.py) -- so emitting
+        # one unit per branch overflows storage and mis-groups advantages.
+        # For a history-rewriting agent the last branch is the most complete
+        # one: it carries the whole conversation, with the earlier turns as
+        # context. Their assistant tokens are therefore not trained on; lifting
+        # that needs variable samples-per-prompt support in the data plane.
+        leaf_hash = self._implicit_export_leaf_hashes(record)[-1]
         leaf_node = record.forest.nodes_by_hash.get(leaf_hash)
         if leaf_node is not None:
             profile = agentic_trace_events(leaf_node.export_metadata_patch)
+            mark_agentic_event(profile, "session_terminal_admission_at", finalize_arrive_at)
             mark_agentic_event(profile, "finalize_arrive_at", finalize_arrive_at)
             mark_agentic_event(profile, "finalize_lock_acquired_at", finalize_lock_acquired_at)
         sample = self._build_sample_from_state_hash(
@@ -2189,6 +2508,8 @@ class AgenticSessionShard:
             reward=reward,
             metadata=metadata,
             mutate_node=True,
+            per_turn_judgements=per_turn_judgements,
+            per_turn_barrier_events=per_turn_barrier_events,
         )
         return self._build_transport_from_unit_payloads(
             [
@@ -2254,6 +2575,15 @@ class AgenticSessionShard:
                     tools=tools,
                     chat_template_kwargs=chat_template_kwargs,
                     rollout_id=record.rollout_id,
+                )
+                # A non-root observation completes the preceding agent action
+                # / tool-call interaction. Trigger the VLM sidecar before the
+                # next rollout request is enqueued, but do not await it here:
+                # later turns overlap the Judge and terminal materialization
+                # joins any remaining work exactly once.
+                self._schedule_per_turn_judge_locked(
+                    record=record,
+                    observation_state_hash=generation_parent_hash,
                 )
                 sampling_params = self._budget_sampling_params(
                     forest=record.forest,
@@ -2340,6 +2670,7 @@ class AgenticSessionShard:
         lock: asyncio.Lock,
         removed: _SessionRecord | None,
         active_tasks: list[asyncio.Task[Any]],
+        per_turn_judge_tasks: list[asyncio.Task[dict[str, Any]]],
         backend_request_ids: list[str],
         waiters: list[asyncio.Future[Any]],
         stats: dict[str, int] | None,
@@ -2359,7 +2690,17 @@ class AgenticSessionShard:
         for active_runner_task in active_tasks:
             if not active_runner_task.done():
                 active_runner_task.cancel()
-        await self._abort_backend_request_ids(backend_request_ids)
+        for judge_task in per_turn_judge_tasks:
+            if not judge_task.done():
+                judge_task.cancel()
+        try:
+            await self._abort_backend_request_ids(backend_request_ids)
+        finally:
+            # A cancelled per-turn task may still be joining a projection
+            # worker thread. Its own finally block owns context.release(), so
+            # drain it even when backend aborting fails.
+            if per_turn_judge_tasks:
+                await asyncio.gather(*per_turn_judge_tasks, return_exceptions=True)
         for active_runner_task in active_tasks:
             active_runner_task.add_done_callback(_log_discarded_runner_result)
         for waiter in waiters:
@@ -2396,20 +2737,23 @@ class AgenticSessionShard:
         _SessionRecord | None,
         dict[str, int] | None,
         list[asyncio.Task[Any]],
+        list[asyncio.Task[dict[str, Any]]],
         list[asyncio.Future[Any]],
         list[str],
     ]:
         removed = self._session_records.pop(session_id, None)
         stats = self._session_stats(removed) if removed is not None else None
         active_tasks: list[asyncio.Task[Any]] = []
+        per_turn_judge_tasks: list[asyncio.Task[dict[str, Any]]] = []
         waiters: list[asyncio.Future[Any]] = []
         backend_request_ids: list[str] = []
         if removed is not None:
             active_tasks = list(removed.active_ir_runner_tasks.values())
+            per_turn_judge_tasks = list(removed.per_turn_judge_tasks.values())
             waiters = list(removed.pending_chat_waiters.values())
             backend_request_ids = [ir.request_id for ir in removed.irs_by_id.values() if ir.backend_started]
             self._clear_removed_record_state(removed)
-        return removed, stats, active_tasks, waiters, backend_request_ids
+        return removed, stats, active_tasks, per_turn_judge_tasks, waiters, backend_request_ids
 
     async def finalize_and_discard(
         self,
@@ -2427,6 +2771,7 @@ class AgenticSessionShard:
                 metadata={"discard_reason": "already_discarded"},
             )
         active_tasks: list[asyncio.Task[Any]] = []
+        per_turn_judge_tasks: list[asyncio.Task[dict[str, Any]]] = []
         waiters: list[asyncio.Future[Any]] = []
         removed = None
         stats = None
@@ -2440,6 +2785,10 @@ class AgenticSessionShard:
                     metadata={"discard_reason": "already_discarded"},
                 )
             try:
+                per_turn_judgements: list[dict[str, Any]] | None = None
+                per_turn_barrier_events: dict[str, Any] | None = None
+                if self._per_turn_reasoning_enabled():
+                    per_turn_judgements, per_turn_barrier_events = await self._await_per_turn_judges_locked(record)
                 transport = self._build_transport_from_output(
                     record=record,
                     reward=reward,
@@ -2447,20 +2796,28 @@ class AgenticSessionShard:
                     output_records=output_records,
                     finalize_arrive_at=finalize_arrive_at,
                     finalize_lock_acquired_at=finalize_lock_acquired_at,
+                    per_turn_judgements=per_turn_judgements,
+                    per_turn_barrier_events=per_turn_barrier_events,
                 )
             except _NonFinalizableExportError as exc:
                 transport = FinalizedResultTransport(
                     status="non_finalizable",
                     metadata={"discard_reason": str(exc)},
                 )
-            removed, stats, active_tasks, waiters, backend_request_ids = self._discard_session_locked(
-                session_id=session_id
-            )
+            (
+                removed,
+                stats,
+                active_tasks,
+                per_turn_judge_tasks,
+                waiters,
+                backend_request_ids,
+            ) = self._discard_session_locked(session_id=session_id)
         await self._finish_discarded_session(
             session_id=session_id,
             lock=lock,
             removed=removed,
             active_tasks=active_tasks,
+            per_turn_judge_tasks=per_turn_judge_tasks,
             backend_request_ids=backend_request_ids,
             waiters=waiters,
             stats=stats,
@@ -2472,18 +2829,25 @@ class AgenticSessionShard:
         if lock is None:
             return False
         active_tasks: list[asyncio.Task[Any]] = []
+        per_turn_judge_tasks: list[asyncio.Task[dict[str, Any]]] = []
         waiters: list[asyncio.Future[Any]] = []
         removed = None
         stats = None
         async with lock:
-            removed, stats, active_tasks, waiters, backend_request_ids = self._discard_session_locked(
-                session_id=session_id
-            )
+            (
+                removed,
+                stats,
+                active_tasks,
+                per_turn_judge_tasks,
+                waiters,
+                backend_request_ids,
+            ) = self._discard_session_locked(session_id=session_id)
         return await self._finish_discarded_session(
             session_id=session_id,
             lock=lock,
             removed=removed,
             active_tasks=active_tasks,
+            per_turn_judge_tasks=per_turn_judge_tasks,
             backend_request_ids=backend_request_ids,
             waiters=waiters,
             stats=stats,

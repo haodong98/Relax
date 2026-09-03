@@ -23,6 +23,9 @@ class Sample:
     response_length: int = 0
     label: str | None = None
     reward: float | dict[str, Any] | None = None
+    # Complete agentic trajectory used by local judges. This field is transient:
+    # it is deliberately excluded from ``to_dict`` / TransferQueue artifacts.
+    reward_context: Any = field(default=None, repr=False, compare=False)
     custom_advantage: float | list[float] | list[list[float]] | None = None
     loss_mask: list[int] | None = None
     weight_versions: list[str] = field(default_factory=list)
@@ -143,8 +146,10 @@ class Sample:
 
     prefix_cache_info: PrefixCacheInfo = field(default_factory=PrefixCacheInfo)
 
-    def to_dict(self):
+    def to_dict(self, *, include_transient: bool = False):
         value = self.__dict__.copy()
+        if not include_transient:
+            value.pop("reward_context", None)
         value["status"] = self.status.value
         value["spec_info"] = self.spec_info.to_dict()
         value["prefix_cache_info"] = self.prefix_cache_info.to_dict()

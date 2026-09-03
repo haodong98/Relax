@@ -51,11 +51,12 @@ class MetricsServiceAdapter:
         # Add timeline events to metrics if enabled
         if self._timeline_enabled:
             timer = Timer()
-            records = timer.log_record_and_clear(step=step)
+            records = timer.log_record_and_clear(step=step, include_critical_path=False)
             if records:
                 # Convert records to trace events and add to metrics
                 events = [record.to_trace_event() for record in records]
-                metrics_to_send[TIMELINE_EVENTS_KEY] = events
+                existing_events = metrics_to_send.get(TIMELINE_EVENTS_KEY, [])
+                metrics_to_send[TIMELINE_EVENTS_KEY] = list(existing_events) + events
 
         if not metrics_to_send:
             logger.warning(f"MetricsServiceAdapter: Warning - No metrics to send for step {step}")
@@ -80,11 +81,12 @@ class MetricsServiceAdapter:
         # Add timeline events if enabled
         if self._timeline_enabled:
             timer = Timer()
-            records = timer.log_record_and_clear(step=step)
+            records = timer.log_record_and_clear(step=step, include_critical_path=False)
             if records:
                 events = [record.to_trace_event() for record in records]
                 metrics = metrics.copy()
-                metrics[TIMELINE_EVENTS_KEY] = events
+                existing_events = metrics.get(TIMELINE_EVENTS_KEY, [])
+                metrics[TIMELINE_EVENTS_KEY] = list(existing_events) + events
 
         result = self.client.log_metrics_batch(step, metrics, immediate=False)
         if not result:

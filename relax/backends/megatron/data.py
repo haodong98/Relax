@@ -19,6 +19,7 @@ from relax.utils import device as device_utils
 from relax.utils import tracking_utils
 from relax.utils.data.data import get_minimum_num_micro_batch_size
 from relax.utils.data.seqlen_balancing import get_seqlen_balanced_partitions
+from relax.utils.distributed_utils import get_gloo_group
 from relax.utils.logging_utils import get_logger
 from relax.utils.metrics.metric_utils import compute_rollout_step
 from relax.utils.opd.opd_utils import OPD_ROLLOUT_LOG_SKIP_FIELDS
@@ -1124,6 +1125,26 @@ def log_perf_data_fwd(args, rollout_id):
 
     timer_instance = Timer()
     log_dict_raw = deepcopy(timer_instance.log_dict())
+    step = compute_rollout_step(args, rollout_id)
+    critical_records = timer_instance.log_record_and_clear(step=step, critical_path_only=True)
+    timeline_enabled = bool(getattr(args, "use_metrics_service", False) and getattr(args, "timeline_dump_dir", None))
+    local_critical_metrics = {
+        key: float(value)
+        for key, value in log_dict_raw.items()
+        if key.startswith("critical_path.") and isinstance(value, (int, float))
+    }
+    local_critical_events = [record.to_trace_event() for record in critical_records] if timeline_enabled else []
+    if timeline_enabled:
+        critical_metrics, critical_events = train_metric_utils._gather_critical_path_payload(
+            local_critical_metrics,
+            local_critical_events,
+            dist.get_world_size(),
+            pid_base=4000,
+            component="actor_fwd",
+        )
+    else:
+        critical_metrics, critical_events = local_critical_metrics, []
+    log_dict_raw.update(critical_metrics)
     timer_instance.reset()
     is_primary_rank = (
         mpu.get_tensor_model_parallel_rank() == 0
@@ -1132,15 +1153,28 @@ def log_perf_data_fwd(args, rollout_id):
     )
 
     if not is_primary_rank:
+        timer_instance.log_record_and_clear(
+            step=step,
+            include_critical_path=False,
+        )
         return
 
     log_dict = {f"perf/{key}_time": val for key, val in log_dict_raw.items()}
-    step = compute_rollout_step(args, rollout_id)
+    if critical_events:
+        log_dict["__timeline_events__"] = critical_events
     log_dict["actor_fwd/step"] = step
     tracking_utils.log(args, log_dict, step_key="actor_fwd/step")
+    timer_instance.log_record_and_clear(step=step, include_critical_path=False)
 
 
-def log_perf_data(rollout_id: int, args: Namespace, flops_counter: FlopsCounter | None = None) -> None:
+def log_perf_data(
+    rollout_id: int,
+    args: Namespace,
+    flops_counter: FlopsCounter | None = None,
+    *,
+    pid_base: int = 3000,
+    component: str = "trainer",
+) -> None:
     train_metric_utils.log_perf_data_raw(
         rollout_id=rollout_id,
         args=args,
@@ -1150,7 +1184,9 @@ def log_perf_data(rollout_id: int, args: Namespace, flops_counter: FlopsCounter 
             and mpu.get_data_parallel_rank(with_context_parallel=True) == 0
         ),
         flops_counter=flops_counter,
-        world_size=dist.get_world_size(),
+        world_size=dist.get_world_size(group=get_gloo_group()),
+        pid_base=pid_base,
+        component=component,
     )
 
 

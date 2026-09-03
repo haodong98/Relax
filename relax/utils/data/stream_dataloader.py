@@ -15,9 +15,10 @@ from transfer_queue.dataloader.streaming_dataloader import StreamingDataLoader
 from transfer_queue.dataloader.streaming_dataset import StreamingDataset
 
 from relax.utils import device as device_utils
+from relax.utils.data.transfer_provenance import extract_data_wait_provenance
 from relax.utils.env import Envs
 from relax.utils.opd.opd_utils import iter_opd_cp_float_fields
-from relax.utils.timer import timer
+from relax.utils.timer import Timer, timer
 
 
 logger = logging.getLogger(__name__)
@@ -1238,7 +1239,7 @@ class StreamingTQIterator:
                 f"dp={self.dp_rank} must pad {pad} dummy micro-batches but consumed zero real micro-batches"
             )
         self._dummies_remaining = pad
-        return self.__next__()
+        return self._next_impl()
 
     def _emit_data_batch(
         self,
@@ -1313,6 +1314,9 @@ class StreamingTQIterator:
         return data, meta
 
     def __next__(self) -> Tuple[Dict[str, Any], Any]:
+        return self._next_impl()
+
+    def _next_impl(self) -> Tuple[Dict[str, Any], Any]:
         # Dummy-padding phase: real data exhausted, emit dummies up to k_global.
         if self._dummies_remaining is not None:
             if self._dummies_remaining <= 0:
@@ -1331,7 +1335,19 @@ class StreamingTQIterator:
         partition_id = f"train_{self.rollout_id}"
 
         t0 = time.monotonic()
+        wait_started_at = time.time()
+        wait_started_ns = time.perf_counter_ns()
         empty_streak = 0
+
+        def record_wait_episode(attributes: dict[str, Any]) -> None:
+            ended_ns = time.perf_counter_ns()
+            Timer().add_complete_span(
+                "critical_path.data_wait",
+                start_wall_s=wait_started_at,
+                end_wall_s=time.time(),
+                duration_s=(ended_ns - wait_started_ns) / 1e9,
+                attributes=attributes,
+            )
 
         while True:
             sampling_config = self._sampling_config(self._batch_index)
@@ -1352,6 +1368,16 @@ class StreamingTQIterator:
             if data is not None:
                 tq_wait = time.monotonic() - t0
                 self._tq_wait_times.append(tq_wait)
+                attributes = extract_data_wait_provenance(
+                    meta,
+                    partition_id=partition_id,
+                    task_name=self.task_name,
+                    dp_rank=self.dp_rank,
+                    batch_index=self._batch_index,
+                    required=getattr(self.args, "rm_type", None) == "dual-agentic-judge",
+                )
+                attributes["rollout_mini_index"] = self.rollout_mini_index
+                record_wait_episode(attributes)
                 return self._emit_data_batch(data, meta, tq_wait=tq_wait)
 
             # Data not yet available for this (dp, batch_index).
@@ -1365,6 +1391,17 @@ class StreamingTQIterator:
                 # no cross-DP all_reduce.
                 extra = getattr(meta, "extra_info", None) or {}
                 if extra.get("dummy_round"):
+                    record_wait_episode(
+                        {
+                            "returned_batch": False,
+                            "batch_status": "dummy",
+                            "partition_id": partition_id,
+                            "task_name": self.task_name,
+                            "dp_rank": self.dp_rank,
+                            "batch_index": self._batch_index,
+                            "rollout_mini_index": self.rollout_mini_index,
+                        }
+                    )
                     return self._emit_dummy_batch()
                 if extra.get("stream_end"):
                     self._shutdown_prefetch()
@@ -1394,6 +1431,17 @@ class StreamingTQIterator:
             # False forever).  Fail fast and diagnosably instead of hanging.
             if elapsed >= self.max_stream_stall_s:
                 self._shutdown_prefetch()
+                record_wait_episode(
+                    {
+                        "returned_batch": False,
+                        "batch_status": "stalled",
+                        "partition_id": partition_id,
+                        "task_name": self.task_name,
+                        "dp_rank": self.dp_rank,
+                        "batch_index": self._batch_index,
+                        "rollout_mini_index": self.rollout_mini_index,
+                    }
+                )
                 raise RuntimeError(
                     f"StreamingTQIterator rollout={self.rollout_id} mini={self.rollout_mini_index} "
                     f"dp={self.dp_rank} stalled {elapsed:.0f}s (>{self.max_stream_stall_s:.0f}s) with no "

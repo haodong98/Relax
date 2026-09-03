@@ -16,6 +16,23 @@ from .actor_group import RayTrainGroup
 logger = get_logger(__name__)
 
 
+def _validate_rollout_engine_node_blocks(
+    rank_to_actual_ip: dict[int, str], *, rank_offset: int, num_engines_per_node: int
+) -> None:
+    """Fail before SGLang init when predicted rank blocks span nodes."""
+    predicted_blocks: dict[int, list[tuple[int, str]]] = {}
+    for rank, actual_ip in sorted(rank_to_actual_ip.items()):
+        block_index = (rank - rank_offset) // num_engines_per_node
+        predicted_blocks.setdefault(block_index, []).append((rank, actual_ip))
+
+    fragmented = {block: rows for block, rows in predicted_blocks.items() if len({ip for _, ip in rows}) > 1}
+    if fragmented:
+        raise RuntimeError(
+            "Rollout placement does not match contiguous per-node rank blocks; "
+            f"refusing to start SGLang with ambiguous dist-init addresses: {fragmented}"
+        )
+
+
 def _get_head_node_id():
     """Get the head node ID based on the head node IP.
 
@@ -142,7 +159,7 @@ def create_rollout_manager(args, pg, data_source=None, runtime_env=None):
     return rollout_manager, num_rollout_per_epoch
 
 
-def create_genrm_manager(args, pg, runtime_env=None):
+def create_genrm_manager(args, pg, runtime_env=None, *, role="genrm"):
     """Create and initialize GenRM manager.
 
     Args:
@@ -159,8 +176,9 @@ def create_genrm_manager(args, pg, runtime_env=None):
     # the same Ray job look this up via ray.get_actor("relax_genrm_manager").
     # Used by custom_reward_post_process_path when GenRM lifecycle is managed
     # from userland.
+    manager_name = "relax_genrm_manager" if role == "genrm" else f"relax_genrm_manager_{role}"
     genrm_manager = GenRMManager.options(
-        name="relax_genrm_manager",
+        name=manager_name,
         num_cpus=1,
         num_gpus=0,
         runtime_env=runtime_env,
@@ -169,7 +187,7 @@ def create_genrm_manager(args, pg, runtime_env=None):
     logger.info("GenRMManager initialized successfully")
 
     # Offload if requested (for colocated mode)
-    if args.offload_rollout:
+    if role == "genrm" and args.offload_rollout:
         logger.info("Offloading GenRM engines (colocated mode)")
         ray.get(genrm_manager.offload.remote())
 

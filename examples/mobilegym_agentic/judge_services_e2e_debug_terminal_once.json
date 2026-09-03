@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "benchmark_mode": "dual",
+  "reasoning_trigger": "terminal_once",
+  "turn_judge_barrier_timeout_s": 600,
+  "max_group_replacements_per_step": 16,
+  "answer_accuracy": {
+    "model_path": "/iopsstor/scratch/cscs/${USER}/mobilegym_e2e/models/Qwen3-8B",
+    "num_gpus_per_engine": 1,
+    "engine_config": {
+      "max_context_len": 32768,
+      "enable_metrics": true
+    },
+    "sampling_config": {
+      "temperature": 0.0,
+      "top_p": 1.0,
+      "top_k": -1,
+      "max_response_len": 256,
+      "chat_template_kwargs": {
+        "enable_thinking": false
+      }
+    },
+    "max_input_tokens": 32512,
+    "max_output_tokens": 256,
+    "timeout_s": 300,
+    "max_attempts": 3,
+    "max_concurrency": 8,
+    "port_base": 16000
+  },
+  "multi_turn_reasoning": {
+    "model_path": "/iopsstor/scratch/cscs/${USER}/mobilegym_e2e/models/Qwen2.5-VL-7B-Instruct",
+    "num_gpus_per_engine": 1,
+    "engine_config": {
+      "max_context_len": 32768,
+      "enable_metrics": true
+    },
+    "sampling_config": {
+      "temperature": 0.0,
+      "top_p": 1.0,
+      "top_k": -1,
+      "max_response_len": 256
+    },
+    "max_input_tokens": 32512,
+    "max_output_tokens": 256,
+    "max_media_items": 12,
+    "max_media_total_bytes": 67108864,
+    "max_pixels_per_item": 2764800,
+    "timeout_s": 300,
+    "max_attempts": 3,
+    "max_concurrency": 8,
+    "port_base": 17000
+  }
+}

@@ -58,6 +58,15 @@ sysctl -w net.ipv4.ip_local_reserved_ports=15000-20000,30000-32768
 # ── environment setup ───────────────────────────────────────────────────────
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 export PYTHONUNBUFFERED=1
+# Ray's log monitor dedups by content template, not by source actor. A GenRM/SGLang engine
+# colocated with the head node (e.g. a judge role placed on the same physical node as the
+# Ray head) can have its structurally-identical per-request log lines ("Prefill batch,
+# #new-seq: ..., #new-token: ...") silently collapsed into "[repeated Nx across cluster]"
+# markers attributed elsewhere, so that engine's own logs never appear in the driver log --
+# see examples/mobilegym_agentic/LATENCY_FINDINGS.md open question 2. Must be set before
+# `ray start` (below); exporting it later, e.g. in a launcher script's own env block, is too
+# late to reach the raylet's log monitor.
+export RAY_DEDUP_LOGS="${RAY_DEDUP_LOGS:-0}"
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export MEGATRON=${MEGATRON:-/root/Megatron-LM/}
 export RELAX=${RELAX:-${DIR}/../../}
@@ -115,7 +124,10 @@ if [ "$MASTER_ADDR" = "$POD_NAME" ]; then
 
     sleep 5
 
-    # Wait for all worker nodes to join
+    # Wait for all worker nodes to join. Keep the default compatible with the
+    # historical launcher, while allowing topology gates to fail fast.
+    cluster_ready_timeout_s="${RAY_CLUSTER_READY_TIMEOUT_S:-600}"
+    cluster_ready_deadline=$((SECONDS + cluster_ready_timeout_s))
     while true; do
         ray_status_output=$(ray status)
         gpu_count=$(echo "$ray_status_output" | grep -oP '(?<=/)\d+\.\d+(?=\s*GPU)' | head -n 1)
@@ -129,6 +141,10 @@ if [ "$MASTER_ADDR" = "$POD_NAME" ]; then
             break
         else
             echo "Waiting for Ray to allocate $NNODES devices. Current device count: $device_count"
+            if [ "${SECONDS}" -ge "${cluster_ready_deadline}" ]; then
+                echo "ERROR: Ray cluster did not reach ${NNODES} nodes within ${cluster_ready_timeout_s}s" >&2
+                exit 1
+            fi
             sleep 5
         fi
     done
@@ -165,7 +181,27 @@ if [ "$MASTER_ADDR" = "$POD_NAME" ]; then
 
 }
 }"
-    exec bash "$RUN_SCRIPT" "$@"
+    if [ -z "${RELAX_SPMD_COMPLETION_FILE:-}" ]; then
+        exec bash "$RUN_SCRIPT" "$@"
+    fi
+
+    # Multi-node Slurm steps otherwise never finish successfully because all
+    # workers remain in their keepalive loop after the head script exits.
+    # Publish the head exit code atomically on the shared filesystem so every
+    # worker can shut down its local Ray daemon and return the same result.
+    publish_spmd_completion() {
+        exit_code=$?
+        trap - EXIT INT TERM
+        completion_tmp="${RELAX_SPMD_COMPLETION_FILE}.head.$$"
+        printf '%s\n' "${exit_code}" >"${completion_tmp}"
+        mv -f "${completion_tmp}" "${RELAX_SPMD_COMPLETION_FILE}"
+        ray stop --force >/dev/null 2>&1 || true
+        exit "${exit_code}"
+    }
+    trap publish_spmd_completion EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    bash "$RUN_SCRIPT" "$@"
 else
     # ── WORKER NODE ─────────────────────────────────────────────────────────
     # NOTE: `set -e` is active, so each retry loop below must keep the
@@ -173,13 +209,14 @@ else
     # otherwise the first failure kills the script and there is no retry.
     GCS_PORT="${GCS_PORT:-6379}"
     echo "=== Worker node: waiting for head GCS at ${MASTER_ADDR}:${GCS_PORT} ==="
-    for i in $(seq 1 120); do
+    ray_gcs_wait_attempts="${RAY_GCS_WAIT_ATTEMPTS:-120}"
+    for i in $(seq 1 "${ray_gcs_wait_attempts}"); do
         if timeout 2 bash -c "</dev/tcp/${MASTER_ADDR}/${GCS_PORT}" 2>/dev/null; then
             echo "Head GCS reachable after ${i} attempt(s)"
             break
         fi
-        if [ "$i" -eq 120 ]; then
-            echo "ERROR: head GCS at ${MASTER_ADDR}:${GCS_PORT} unreachable after 10min" >&2
+        if [ "$i" -eq "${ray_gcs_wait_attempts}" ]; then
+            echo "ERROR: head GCS at ${MASTER_ADDR}:${GCS_PORT} unreachable after ${ray_gcs_wait_attempts} attempts" >&2
             exit 1
         fi
         sleep 5
@@ -187,7 +224,8 @@ else
 
     echo "=== Worker node: joining Ray cluster at ${MASTER_ADDR}:${GCS_PORT} ==="
     joined=0
-    for i in $(seq 1 30); do
+    ray_join_attempts="${RAY_JOIN_ATTEMPTS:-30}"
+    for i in $(seq 1 "${ray_join_attempts}"); do
         ray stop --force >/dev/null 2>&1 || true
         if ray start \
             --address="${MASTER_ADDR}:${GCS_PORT}" \
@@ -204,7 +242,7 @@ else
         sleep 5
     done
     if [ "$joined" -ne 1 ]; then
-        echo "ERROR: worker failed to join Ray cluster after 30 attempts" >&2
+        echo "ERROR: worker failed to join Ray cluster after ${ray_join_attempts} attempts" >&2
         exit 1
     fi
 
@@ -214,7 +252,21 @@ else
     fi
     echo "Successfully connected to the Ray cluster!"
 
-    # Worker nodes block indefinitely (training runs on head node)
+    # Worker nodes keep their Ray daemons alive until the head publishes its
+    # exit status. Legacy callers without a completion file retain the old
+    # indefinite keepalive contract.
     echo "=== Worker node ready, waiting for training to complete ==="
-    sleep inf
+    if [ -z "${RELAX_SPMD_COMPLETION_FILE:-}" ]; then
+        sleep inf
+    fi
+    while [ ! -s "${RELAX_SPMD_COMPLETION_FILE}" ]; do
+        sleep 2
+    done
+    head_exit_code="$(tr -d '[:space:]' <"${RELAX_SPMD_COMPLETION_FILE}")"
+    if ! [[ "${head_exit_code}" =~ ^[0-9]+$ ]]; then
+        echo "ERROR: invalid SPMD completion status: ${head_exit_code}" >&2
+        exit 1
+    fi
+    ray stop --force >/dev/null 2>&1 || true
+    exit "${head_exit_code}"
 fi

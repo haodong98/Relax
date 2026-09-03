@@ -24,6 +24,9 @@ class FakeTimer:
     def reset(self):
         pass
 
+    def log_record_and_clear(self, step, **kwargs):
+        return []
+
 
 def _collect_perf_metrics(monkeypatch, peak_tflops):
     timer = FakeTimer()
@@ -64,3 +67,14 @@ def test_log_perf_data_raw_reports_mfu_for_known_peak(monkeypatch):
 
     assert logged_metrics["perf/device_peak_tflops"] == 100.0
     assert logged_metrics["perf/mfu/actor_train"] == 0.75
+
+
+def test_merge_critical_path_rank_max_uses_slowest_rank_per_phase():
+    merged = train_metric_utils._merge_critical_path_rank_max(
+        [
+            {"critical_path.training": 2.0, "critical_path.data_wait": 4.0, "actor_train": 2.0},
+            {"critical_path.training": 3.0, "critical_path.data_wait": 1.0, "actor_train": 3.0},
+        ]
+    )
+
+    assert merged == {"critical_path.training": 3.0, "critical_path.data_wait": 4.0}

@@ -6,6 +6,9 @@ from argparse import Namespace
 import pytest
 import torch
 
+from relax.utils.data.transfer_provenance import TRANSFER_PROVENANCE_KEY, build_transfer_provenance
+from relax.utils.timer import Timer
+
 
 def _load_stream_module(monkeypatch):
     megatron = types.ModuleType("megatron")
@@ -158,6 +161,53 @@ def test_streaming_tq_iterator_polls_until_window_drained(monkeypatch):
     assert len(next(iterator)[0]["tokens"]) == 1
     with pytest.raises(StopIteration):
         next(iterator)
+
+
+def test_streaming_tq_iterator_records_actual_returned_group_keys(monkeypatch):
+    stream_module = _load_stream_module(monkeypatch)
+    monkeypatch.setattr(stream_module.device_utils, "make_current_torch_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(stream_module.dist, "all_reduce", lambda tensor, op=None, group=None: None)
+
+    group_key = [["session-52", 0, None], ["session-52", 1, None]]
+
+    class _Meta:
+        partition_ids = ["train_52", "train_52"]
+        extra_info = {}
+
+        def get_all_custom_meta(self):
+            return [
+                {
+                    TRANSFER_PROVENANCE_KEY: build_transfer_provenance(
+                        sample_key=sample_key,
+                        group_key=group_key,
+                        partition_id="train_52",
+                    )
+                }
+                for sample_key in group_key
+            ]
+
+    monkeypatch.setattr(
+        stream_module,
+        "get_data_from_transfer_queue",
+        lambda **kwargs: ({"tokens": [torch.tensor([0]), torch.tensor([1])]}, _Meta()),
+    )
+    timer = Timer()
+    timer.reset()
+    timer.records.clear()
+    iterator = _make_iterator(
+        stream_module,
+        get_data_fn=lambda **kwargs: None,
+        all_consumed_fn=lambda: False,
+        args=Namespace(rm_type="dual-agentic-judge"),
+    )
+
+    next(iterator)
+
+    records = [record for record in timer.records if record.name == "critical_path.data_wait"]
+    assert len(records) == 1
+    assert records[0].attributes["returned_sample_keys"] == group_key
+    assert records[0].attributes["returned_group_keys"] == [group_key]
+    assert records[0].attributes["trainer_batch_id"] == "train_52:actor_train:0"
 
 
 def test_streaming_tq_iterator_raises_on_stall_timeout(monkeypatch):

@@ -107,6 +107,11 @@ def main(args):
 
     _maybe_pin_baseline_to_stable(args)
 
+    if getattr(args, "rm_type", None) == "dual-agentic-judge":
+        from relax.utils.judge_config import dual_judge_benchmark_invariant_hash
+
+        args._dual_judge_frozen_invariant_hash = dual_judge_benchmark_invariant_hash(args)
+
     ctrl = Controller(args, runtime_env)
     _ctrl = ctrl
 

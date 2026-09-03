@@ -12,7 +12,7 @@ from typing import Any, Literal
 import numpy as np
 import torch
 
-from relax.agentic.profile import TRACE_KEY, merge_agentic_trace
+from relax.agentic.profile import TRACE_KEY, agentic_trace_events, mark_agentic_event, merge_agentic_trace
 from relax.utils.types import Sample
 
 
@@ -228,7 +228,12 @@ class TrainingFieldArtifact:
 
     @classmethod
     def from_sample(cls, sample: Sample) -> "TrainingFieldArtifact":
-        return cls(sample_payload=_compact_sample_payload(sample.to_dict()))
+        # reward_context crosses the session-process boundary only as far as the
+        # resident RewardDomain. The judge handler releases it before samples
+        # can enter TransferQueue; normal Sample.to_dict() still excludes it.
+        return cls(
+            sample_payload=_compact_sample_payload(sample.to_dict(include_transient=sample.reward_context is not None))
+        )
 
     def to_sample(self) -> Sample:
         return Sample.from_dict(_expand_sample_payload(self.sample_payload))
@@ -730,6 +735,10 @@ class SessionForest:
         *,
         leaf_state_hash: str,
         tokenizer: Any,
+        include_reward_context: bool = False,
+        reward_context_kind: str = "trajectory",
+        per_turn_judgements: list[dict[str, Any]] | None = None,
+        per_turn_barrier_events: dict[str, Any] | None = None,
         # mask_offpolicy_in_partial_rollout: bool = False,
     ) -> Sample:
         lineage = self.lineage(leaf_state_hash)
@@ -752,6 +761,18 @@ class SessionForest:
         generation_elapsed_s = 0.0
         first_response_node: MsgNode | None = None
         last_response_status: str | None = None
+        per_turn_by_response = {
+            item.get("response_state_hash"): item
+            for item in (per_turn_judgements or [])
+            if isinstance(item, dict) and isinstance(item.get("response_state_hash"), str)
+        }
+        # Judgements are scheduled per completed resp->obs interaction, but the
+        # forest is a prefix-matched tree: an agent that trims or replays its
+        # message history branches off an interior node, and the abandoned
+        # branch's judgements must not be averaged into this leaf's reward.
+        # Collected in lineage order below so the exported list, the trace
+        # count, and the emitted turn spans all describe the same interactions.
+        lineage_judgements: list[dict[str, Any]] = []
 
         for idx, node in enumerate(lineage):
             tokens.extend(node.train_token_delta)
@@ -766,7 +787,12 @@ class SessionForest:
                     first_response_node = node
                 if node.status is not None:
                     last_response_status = node.status
-                turns.append(self._agentic_trace_turn_from_node(node, len(turns)))
+                turn_trace = self._agentic_trace_turn_from_node(node, len(turns))
+                turn_judgement = per_turn_by_response.get(node.state_hash)
+                if turn_judgement is not None:
+                    turn_trace["judge"] = copy.deepcopy(turn_judgement)
+                    lineage_judgements.append(turn_judgement)
+                turns.append(turn_trace)
                 continuation_train_tokens.extend(node.train_token_delta)
                 node_loss_mask = list(node.loss_mask_delta)
                 # if mask_offpolicy_in_partial_rollout and node.rollout_id < leaf.rollout_id:
@@ -810,6 +836,24 @@ class SessionForest:
                 "turns": turns,
             }
         )
+        if per_turn_judgements is not None:
+            trace["reasoning_trigger"] = "per_turn"
+            trace["per_turn_judge_count"] = len(lineage_judgements)
+            # A per-turn judge scores one completed resp->observation pair, so
+            # the trajectory's final response — which has no following
+            # observation — is covered by the answer Judge alone. Terminal-once
+            # does read it. Export both counts so a reward comparison between
+            # the two triggers can state that coverage difference from the
+            # trace instead of inferring it.
+            trace["per_turn_assistant_turn_count"] = len(turns)
+            off_lineage_count = len(per_turn_judgements) - len(lineage_judgements)
+            if off_lineage_count:
+                trace["per_turn_off_lineage_judge_count"] = off_lineage_count
+        if per_turn_barrier_events:
+            events = trace.setdefault("events", {})
+            if not isinstance(events, dict):
+                raise TypeError(f"{TRACE_KEY}.events must be a dict")
+            events.update(copy.deepcopy(per_turn_barrier_events))
         merged_metadata[TRACE_KEY] = trace
         # Mirror the turn count to ``rollout_turns`` so consumers that predate
         # the agentic trace (train_dump_utils, the non-agentic rollout metric
@@ -822,6 +866,62 @@ class SessionForest:
             status = leaf.status
         if status is None:
             status = last_response_status or Sample.Status.COMPLETED.value
+        reward_context: Any = None
+        if include_reward_context:
+            from relax.agentic.session.reward_context import (
+                RewardContextError,
+                build_accuracy_reward_context,
+                build_reward_context,
+            )
+
+            context_profile = agentic_trace_events(merged_metadata)
+            mark_agentic_event(context_profile, "reward_context_build_start_at")
+            try:
+                context_kwargs = {
+                    "session_id": self.session_id,
+                    "group_index": self.group_index,
+                    "sample_index": self.index,
+                    "leaf_state_hash": leaf_state_hash,
+                    "lineage": lineage,
+                    "reference_answer": self.label,
+                    # ``merged_metadata`` includes terminal wrapper evidence
+                    # (for example MobileGym outcome observations) while the
+                    # projection helpers whitelist exactly what they consume.
+                    "static_metadata": merged_metadata,
+                    "terminal_status": str(status),
+                    "remove_sample": leaf.remove_sample,
+                }
+                if reward_context_kind == "trajectory":
+                    reward_context = build_reward_context(
+                        **context_kwargs,
+                        tools=merged_metadata["tools"],
+                    )
+                elif reward_context_kind in {"accuracy", "per_turn"}:
+                    # Fall back on the *lineage* count: a trajectory whose only
+                    # judgements belong to an abandoned branch has no scored
+                    # interaction of its own and must use the terminal-once
+                    # path rather than average an off-lineage score.
+                    use_terminal_fallback = reward_context_kind == "per_turn" and not lineage_judgements
+                    if use_terminal_fallback:
+                        reward_context = build_reward_context(
+                            **context_kwargs,
+                            tools=merged_metadata["tools"],
+                        )
+                        reward_context.per_turn_fallback_terminal_once = True
+                    else:
+                        reward_context = build_accuracy_reward_context(**context_kwargs)
+                    if reward_context_kind == "per_turn":
+                        reward_context.per_turn_judgements = copy.deepcopy(lineage_judgements)
+                else:
+                    raise ValueError(f"Unknown reward_context_kind: {reward_context_kind!r}")
+                context_profile["reward_context_kind"] = reward_context_kind
+            except RewardContextError as exc:
+                # Context/media failures are sample-local judge rejections. Preserve
+                # the typed error transiently so the reward domain can reject the
+                # entire GRPO group instead of turning it into a rollout failure.
+                reward_context = exc
+            finally:
+                mark_agentic_event(context_profile, "reward_context_build_end_at")
         sample = Sample(
             group_index=self.group_index,
             index=self.index,
@@ -834,6 +934,7 @@ class SessionForest:
             response_length=len(continuation_train_tokens),
             label=self.label,
             reward=copy.deepcopy(leaf.reward),
+            reward_context=reward_context,
             loss_mask=loss_mask,
             weight_versions=weight_versions,
             rollout_log_probs=rollout_log_probs,

@@ -12,7 +12,7 @@ import ray
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from relax.backends.sglang.sglang_engine import GenRMEngine
-from relax.distributed.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, Lock
+from relax.distributed.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, Lock, propagate_allowlisted_env_vars
 from relax.utils.http_utils import init_http_client
 from relax.utils.logging_utils import get_logger
 
@@ -53,6 +53,7 @@ class GenRMManager:
         # safe no-ops. Engines start onloaded; the caller (placement_group.py)
         # may immediately offload if offload_rollout is set.
         self._onloaded = True
+        self._disposed = False
 
     @property
     def genrm_engines(self):
@@ -131,6 +132,51 @@ class GenRMManager:
                 results.append((info["host"], info["port"]))
         return results
 
+    def get_gpu_occupancy_snapshot(self) -> list[dict] | None:
+        """Fan out to each engine's JudgeGpuSampler and collect cumulative
+        NVML/SGLang accumulators.
+
+        Uses ``self.genrm_engines`` (head engine per multi-node engine, see the
+        property above) since only node_rank 0 shards run the sampler's SGLang
+        scrape target; NVML-only entries from other shards are still each
+        engine's own responsibility to include in its own snapshot. Returns
+        None (rather than raising) when no engine reports a snapshot, e.g.
+        because RELAX_JUDGE_GPU_SAMPLE_DIR is unset.
+        """
+        snapshots = []
+        for engine in self.genrm_engines:
+            if engine is None:
+                continue
+            try:
+                snapshot = ray.get(engine.get_gpu_sample_snapshot.remote(), timeout=5.0)
+            except Exception as e:
+                logger.warning(f"GenRM GPU occupancy snapshot failed: {e}")
+                continue
+            if snapshot is not None:
+                snapshots.append(snapshot)
+        return snapshots or None
+
+    def dispose(self):
+        """Idempotently stop all SGLang engine actors owned by this manager."""
+        if self._disposed:
+            return
+        self._disposed = True
+        for engine in self.all_genrm_engines:
+            if engine is None:
+                continue
+            try:
+                ray.get(engine.shutdown.remote(), timeout=10)
+            except Exception:
+                try:
+                    ray.kill(engine)
+                except Exception:
+                    logger.warning("Failed to kill GenRM engine during dispose", exc_info=True)
+        try:
+            ray.kill(self.genrm_engine_lock)
+        except Exception:
+            pass
+        self.all_genrm_engines = []
+
 
 def init_genrm_engines(args, pg, all_genrm_engines, engine_addr_and_ports=None):
     """Initialize genRM engines on the placement group.
@@ -167,7 +213,8 @@ def init_genrm_engines(args, pg, all_genrm_engines, engine_addr_and_ports=None):
 
         gpu_idx = i * num_gpu_per_engine
 
-        if not args.fully_async and not shared_with_rollout:
+        dedicated = getattr(args, "genrm_role", "genrm") != "genrm"
+        if not dedicated and not args.fully_async and not shared_with_rollout:
             gpu_idx += args.rollout_num_gpus
 
         # Get the base GPU ID from placement group
@@ -194,6 +241,11 @@ def init_genrm_engines(args, pg, all_genrm_engines, engine_addr_and_ports=None):
             # custom_all_reduce.cuh:37: CUDA error: invalid argument during CUDA graph capture.
             "SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2": "0",
         }
+        # GenRMEngine declares its own runtime_env, so it does not inherit the
+        # manager's runtime_env automatically. Honour the driver's explicit
+        # propagation allow-list here as well; this is required for overlay
+        # libraries such as the venv cuDNN used by Transformer Engine.
+        propagate_allowlisted_env_vars(env_vars)
         if getattr(args, "fp16", False):
             env_vars["SGLANG_MAMBA_CONV_DTYPE"] = "float16"
 
@@ -247,7 +299,8 @@ def _allocate_genrm_engine_addr_and_ports(*, args, num_engines, genrm_engines):
         num_engines_on_this_node = num_engines_per_node - (rank % num_engines_per_node)
 
         def get_addr_and_ports(engine):
-            start_port = 16000  # Use different port range than rollout (15000)
+            start_port = int(getattr(args, "genrm_port_base", 16000))
+            port_limit = start_port + int(getattr(args, "genrm_port_band_size", 1000))
 
             def port(consecutive=1):
                 nonlocal start_port
@@ -257,6 +310,10 @@ def _allocate_genrm_engine_addr_and_ports(*, args, num_engines, genrm_engines):
                         consecutive=consecutive,
                     )
                 )
+                if port + consecutive > port_limit:
+                    raise RuntimeError(
+                        f"GenRM port band exhausted: [{getattr(args, 'genrm_port_base', 16000)}, {port_limit})"
+                    )
                 start_port = port + consecutive
                 return port
 

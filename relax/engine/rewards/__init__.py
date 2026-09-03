@@ -350,6 +350,13 @@ class RewardExecutor:
 
         self._ensure_semaphore()
         async with self._semaphore:
+            # v1 dual judges are a fixed route. Per-sample metadata must not
+            # dynamically replace either required judge with another RM type.
+            if getattr(args, "rm_type", None) == "dual-agentic-judge":
+                spec = get_reward_spec("dual-agentic-judge")
+                if spec is None:
+                    raise RuntimeError("dual-agentic-judge reward is not registered")
+                return await spec.resolve()(args, sample)
             metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
             route = resolve_rm_type(
                 metadata_rm_type=metadata.get("rm_type"),
@@ -439,6 +446,11 @@ async def remote_rm(args, sample: Sample, max_retries: int = 10):
 # Async rm_types run in the event loop (not dispatched to the worker pool).
 register_reward("remote_rm", remote_rm, mode="async")
 register_reward("dapo-genrm", async_compute_score_genrm, mode="async")
+register_reward(
+    "dual-agentic-judge",
+    "relax.engine.rewards.dual_agentic_judge:async_compute_dual_agentic_judge",
+    mode="async",
+)
 # `dummy` returns 0 without any computation. Use it when the real reward is
 # produced elsewhere (e.g., --custom-reward-post-process-path does batched
 # GenRM scoring after all rollout finishes).

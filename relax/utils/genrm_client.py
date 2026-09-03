@@ -7,7 +7,7 @@ generative reward model evaluations.
 """
 
 import asyncio
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import httpx
 
@@ -25,8 +25,16 @@ _GENRM_INITIAL_BACKOFF_SEC = 0.5
 
 logger = get_logger(__name__)
 
-# Module-level singleton to avoid creating a new client per request
-_genrm_client: Optional["GenRMClient"] = None
+# Clients are isolated by role, normalized URL and timeout. A single global
+# instance silently routed the second judge to the first judge's URL.
+_genrm_clients: dict[tuple[asyncio.AbstractEventLoop | None, str, str, float], "GenRMClient"] = {}
+
+
+def _running_loop() -> asyncio.AbstractEventLoop | None:
+    try:
+        return asyncio.get_running_loop()
+    except RuntimeError:
+        return None
 
 
 class GenRMClient:
@@ -37,7 +45,7 @@ class GenRMClient:
     event loop in async rollout contexts.
     """
 
-    def __init__(self, service_url: Optional[str] = None, timeout: float = 1800.0):
+    def __init__(self, service_url: Optional[str] = None, timeout: float = 1800.0, *, role: str = "genrm"):
         """Initialize GenRM client.
 
         Args:
@@ -45,10 +53,11 @@ class GenRMClient:
             timeout: Request timeout in seconds
         """
         if service_url is None:
-            service_url = get_serve_url("genrm")
+            service_url = get_serve_url(role)
 
         self.service_url = service_url.rstrip("/")
         self.timeout = timeout
+        self.role = role
         # Raise pool limits above httpx's default 100 — a reward step can fire
         # thousands of concurrent judge calls and a small pool serializes them;
         # keepalive_expiry >> the default 5s so reused connections aren't reaped
@@ -83,7 +92,6 @@ class GenRMClient:
         Returns:
             Raw response string from the GenRM model
         """
-        url = f"{self.service_url}/generate"
         payload: Dict = {
             "messages": messages,
         }
@@ -93,10 +101,7 @@ class GenRMClient:
         backoff = _GENRM_INITIAL_BACKOFF_SEC
         for attempt in range(1, _GENRM_MAX_ATTEMPTS + 1):
             try:
-                resp = await self._async_client.post(url, json=payload)
-                resp.raise_for_status()
-                result = resp.json()
-                return result.get("response", "")
+                return await self.generate_once(payload)
             except httpx.HTTPStatusError as e:
                 # 4xx is a client bug — don't retry.
                 if e.response.status_code < 500:
@@ -124,6 +129,29 @@ class GenRMClient:
             await asyncio.sleep(backoff)
             backoff *= 2
 
+    async def generate_once(self, payload: dict[str, Any]) -> str:
+        """Make one request without retries (dual-judge executor owns
+        policy)."""
+        response, _timings = await self.generate_once_profiled(payload)
+        return response
+
+    async def generate_once_profiled(self, payload: dict[str, Any]) -> tuple[str, dict[str, float | int]]:
+        """Make one request and return server-side timing decomposition."""
+        resp = await self._async_client.post(f"{self.service_url}/generate", json=payload)
+        resp.raise_for_status()
+        result = resp.json()
+        if not isinstance(result, dict) or not isinstance(result.get("response"), str):
+            raise ValueError("GenRM service response must contain a string 'response'")
+        raw_timings = result.get("timings", {})
+        if not isinstance(raw_timings, dict):
+            raise ValueError("GenRM service response 'timings' must be a mapping")
+        timings: dict[str, float | int] = {}
+        for key, value in raw_timings.items():
+            if not isinstance(key, str) or isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError("GenRM service response 'timings' must contain numeric values")
+            timings[key] = value
+        return result["response"], timings
+
     def health_check(self) -> Dict:
         """Check health status of GenRM service (sync, safe to call at init).
 
@@ -142,28 +170,58 @@ class GenRMClient:
                 "error": str(e),
             }
 
-    def get_metrics(self) -> Dict:
+    def get_metrics(self, *, include_gpu_occupancy: bool = False) -> Dict:
         """Get metrics from GenRM service.
+
+        ``include_gpu_occupancy`` is intentionally opt-in because it causes
+        the Serve replica to make a manager RPC for raw sampler snapshots.
+        Normal health/occupancy reads stay local to the replica.
 
         Returns:
             Dictionary with service metrics
         """
         url = f"{self.service_url}/metrics"
         try:
-            resp = self._sync_client.get(url)
+            resp = self._sync_client.get(url, params={"include_gpu_occupancy": include_gpu_occupancy})
             resp.raise_for_status()
             return resp.json()
         except Exception as e:
             logger.error(f"GenRM metrics request failed: {e}")
             return {}
 
+    async def aget_metrics(self, *, include_gpu_occupancy: bool = False) -> Dict:
+        """Async counterpart of ``get_metrics`` for callers already running in
+        an event loop.
+
+        Returns:
+            Dictionary with service metrics, or {} on any failure. Never
+            raises: this is an observability side-channel and must not be
+            able to interrupt the reward/rollout path it is reporting on.
+        """
+        url = f"{self.service_url}/metrics"
+        try:
+            resp = await self._async_client.get(url, params={"include_gpu_occupancy": include_gpu_occupancy})
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.warning(f"GenRM async metrics request failed: {e}")
+            return {}
+
+    async def aclose(self) -> None:
+        """Close both HTTP clients without leaking the async connection
+        pool."""
+        self._sync_client.close()
+        await self._async_client.aclose()
+
     def close(self):
-        """Close both HTTP clients."""
+        """Compatibility close for synchronous callers."""
         self._sync_client.close()
         try:
-            self._async_client.close()
-        except Exception:
-            pass
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            asyncio.run(self._async_client.aclose())
+        else:
+            loop.create_task(self._async_client.aclose())
 
     def __enter__(self):
         return self
@@ -172,20 +230,51 @@ class GenRMClient:
         self.close()
 
 
-def get_genrm_client(service_url: Optional[str] = None, timeout: float = 1800.0) -> GenRMClient:
-    """Get or create a singleton GenRM client.
+def get_genrm_client(
+    service_url: Optional[str] = None,
+    timeout: float = 1800.0,
+    *,
+    role: str = "genrm",
+) -> GenRMClient:
+    """Get or create a role/URL/timeout-scoped GenRM client.
 
-    Uses module-level caching to avoid creating a new HTTP client and
-    health-check round trip on every call.
+    Uses module-level keyed caching to avoid creating a new HTTP client per
+    call without allowing two dedicated judges to share the wrong URL.
 
     Args:
         service_url: URL of the GenRM service
         timeout: Request timeout in seconds
 
     Returns:
-        GenRMClient instance (cached singleton)
+        Cached GenRMClient instance for the exact key
     """
-    global _genrm_client
-    if _genrm_client is None:
-        _genrm_client = GenRMClient(service_url=service_url, timeout=timeout)
-    return _genrm_client
+    normalized_url = (service_url or get_serve_url(role)).rstrip("/")
+    key = (_running_loop(), role, normalized_url, float(timeout))
+    client = _genrm_clients.get(key)
+    if client is None:
+        client = GenRMClient(service_url=normalized_url, timeout=timeout, role=role)
+        _genrm_clients[key] = client
+    return client
+
+
+async def close_all_genrm_clients() -> None:
+    """Atomically detach and close every cached client."""
+    clients = list(_genrm_clients.values())
+    _genrm_clients.clear()
+    if clients:
+        await asyncio.gather(*(client.aclose() for client in clients), return_exceptions=True)
+
+
+async def close_genrm_clients_for_current_loop() -> None:
+    """Close clients owned by the caller's asyncio loop without touching live
+    peers."""
+    loop = _running_loop()
+    keys = [key for key in _genrm_clients if key[0] is loop]
+    clients = [_genrm_clients.pop(key) for key in keys]
+    if clients:
+        await asyncio.gather(*(client.aclose() for client in clients), return_exceptions=True)
+
+
+async def close_all() -> None:
+    """Public short alias used by controller/test teardown."""
+    await close_all_genrm_clients()

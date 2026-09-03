@@ -3,7 +3,7 @@
 import torch
 
 from relax.utils.multimodal.stats import get_multimodal_token_counts, get_sample_multimodal_stats
-from relax.utils.training.train_dump_utils import _sample_to_summary_record
+from relax.utils.training.train_dump_utils import _reward_snapshot_to_summary_record, _sample_to_summary_record
 from relax.utils.types import Sample
 
 
@@ -57,3 +57,54 @@ def test_rollout_summary_record_includes_token_and_agent_stats():
     assert record["image_token_count"] == 16
     assert record["multimodal_token_count"] == 16
     assert record["agent_turns"] == 2
+
+
+def test_rollout_summary_record_preserves_compact_reward_latency_trace():
+    sample = Sample(
+        tokens=[1, 2],
+        response_length=1,
+        metadata={
+            "agentic_trace": {
+                "events": {"reward_arrive_at": 1.0, "reward_end_at": 2.0},
+                "reward": {"schema_version": 1, "pipeline_elapsed_s": 1.0},
+                "reasoning_trigger": "per_turn",
+                "per_turn_assistant_turn_count": 2,
+                "turns": [
+                    {
+                        "generation_elapsed_s": 0.5,
+                        "events": {"generation_start_at": 0.0, "generation_end_at": 0.5},
+                        "prompt_text": "must not be copied",
+                    }
+                ],
+            }
+        },
+    )
+
+    record = _sample_to_summary_record(sample, rollout_id=1, idx=0)
+
+    assert record["latency_trace"]["reward"]["pipeline_elapsed_s"] == 1.0
+    assert record["latency_trace"]["turns"][0]["generation_elapsed_s"] == 0.5
+    assert record["latency_trace"]["per_turn_assistant_turn_count"] == 2
+    assert record["latency_trace"]["per_turn_off_lineage_judge_count"] == 0
+    assert "prompt_text" not in record["latency_trace"]["turns"][0]
+
+
+def test_reward_trace_without_turns_is_persisted_for_failed_sample():
+    metadata = {
+        "agentic_trace": {
+            "events": {"reward_arrive_at": 1.0, "reward_end_at": 2.0},
+            "reward": {
+                "pipeline_elapsed_s": 1.0,
+                "pipeline_status": "cancelled",
+                "terminal_outcome": "group_rejected",
+                "sample_index": 4,
+            },
+        }
+    }
+
+    record = _reward_snapshot_to_summary_record(metadata, rollout_id=2, idx=0)
+
+    assert record["record_type"] == "reward_terminal_trace"
+    assert record["sample_index"] == 4
+    assert record["status"] == "group_rejected"
+    assert record["latency_trace"]["turns"] == []

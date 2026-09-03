@@ -1,20 +1,26 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import os
+import socket
 import threading
 import traceback
 from contextlib import contextmanager
+from contextvars import ContextVar
+from copy import deepcopy
 from functools import wraps
-from time import time
+from time import perf_counter_ns, time
+from typing import Optional
 
 from relax.utils.logging_utils import get_logger
 
 from .misc import SingletonMeta
 
 
-__all__ = ["Timer", "timer", "TimelineEvent"]
+__all__ = ["Timer", "timer", "span_timer", "timeline_step", "TimelineEvent"]
 
 logger = get_logger(__name__)
+_timeline_step: ContextVar[Optional[int]] = ContextVar("relax_timeline_step", default=None)
+_clock_host = socket.gethostname()
 
 
 def _is_dist_rank0() -> bool:
@@ -60,6 +66,8 @@ class TimelineEvent:
         tid: int = None,
         step: int = None,
         call_stack: str = None,
+        duration_s: float = None,
+        attributes: dict | None = None,
     ):
         self.name = name
         self.start_ts = start_ts
@@ -68,6 +76,8 @@ class TimelineEvent:
         self.tid = tid if tid is not None else get_default_tid()
         self.step = step
         self.call_stack = call_stack
+        self.duration_s = duration_s
+        self.attributes = deepcopy(attributes or {})
 
     def to_trace_event(self) -> dict:
         """Convert to Chrome Trace Event format (ph='X' complete event)."""
@@ -75,17 +85,18 @@ class TimelineEvent:
             "name": self.name,
             "ph": "X",
             "ts": int(self.start_ts * 1e6),  # Convert to microseconds
-            "dur": int((self.end_ts - self.start_ts) * 1e6),  # Duration in microseconds
+            "dur": int(
+                (self.duration_s if self.duration_s is not None else self.end_ts - self.start_ts) * 1e6
+            ),  # Duration in microseconds
             "pid": self.pid,
             "tid": self.tid,
         }
-        args = {}
+        args = {**self.attributes, "clock_host": _clock_host}
         if self.step is not None:
             args["step"] = self.step
         if self.call_stack:
             args["call_stack"] = self.call_stack
-        if args:
-            event["args"] = args
+        event["args"] = args
         return event
 
     def __repr__(self):
@@ -94,6 +105,7 @@ class TimelineEvent:
 
 class Timer(metaclass=SingletonMeta):
     def __init__(self):
+        self._lock = threading.RLock()
         self.timers = {}
         self.start_time = {}
         self.start_info = {}  # Store start info (timestamp, call_stack) for each timer
@@ -110,6 +122,7 @@ class Timer(metaclass=SingletonMeta):
         self.start_info[name] = {
             "timestamp": self.start_time[name],
             "call_stack": get_call_stack(),
+            "step": _timeline_step.get(),
         }
 
     def end(self, name, keep: bool = True, **kwargs):
@@ -135,10 +148,11 @@ class Timer(metaclass=SingletonMeta):
             end_ts=end_ts,
             pid=get_default_pid(),
             tid=get_default_tid(),
-            step=0,  # to be filled
+            step=start_info.get("step"),
             call_stack=call_stack,
         )
-        self.records.append(record)
+        with self._lock:
+            self.records.append(record)
 
         del self.start_time[name]
         if name in self.start_info:
@@ -150,28 +164,70 @@ class Timer(metaclass=SingletonMeta):
         return elapsed_time
 
     def reset(self, name=None):
-        if name is None:
-            self.timers = {}
-        elif name in self.timers:
-            del self.timers[name]
+        with self._lock:
+            if name is None:
+                self.timers = {}
+            elif name in self.timers:
+                del self.timers[name]
 
     def add(self, name, elapsed_time):
-        self.timers[name] = self.timers.get(name, 0) + elapsed_time
+        with self._lock:
+            self.timers[name] = self.timers.get(name, 0) + elapsed_time
+
+    def add_complete_span(
+        self,
+        name: str,
+        *,
+        start_wall_s: float,
+        end_wall_s: float,
+        duration_s: float,
+        attributes: dict | None = None,
+    ) -> None:
+        """Record a monotonic duration with wall-clock placement for a
+        timeline."""
+        with self._lock:
+            self.timers[name] = self.timers.get(name, 0) + duration_s
+            self.records.append(
+                TimelineEvent(
+                    name=name,
+                    start_ts=start_wall_s,
+                    end_ts=end_wall_s,
+                    duration_s=duration_s,
+                    step=_timeline_step.get(),
+                    attributes=attributes,
+                )
+            )
 
     def log_dict(self):
         """Return timer name -> elapsed time dict (original behavior)."""
-        return self.timers
+        with self._lock:
+            return self.timers.copy()
 
-    def log_record_and_clear(self, step: int):
+    def log_record_and_clear(
+        self,
+        step: int,
+        *,
+        include_critical_path: bool = True,
+        critical_path_only: bool = False,
+    ):
         """Return records and clear them atomically.
 
         This is the recommended method for retrieving timeline events to avoid
         potential duplication if log() is called multiple times.
         """
-        records = self.records.copy()
-        self.records.clear()
-        for r in records:
-            r.step = step
+        with self._lock:
+            if critical_path_only:
+                records = [record for record in self.records if record.name.startswith("critical_path.")]
+                self.records = [record for record in self.records if not record.name.startswith("critical_path.")]
+            elif include_critical_path:
+                records = self.records.copy()
+                self.records.clear()
+            else:
+                records = [record for record in self.records if not record.name.startswith("critical_path.")]
+                self.records = [record for record in self.records if record.name.startswith("critical_path.")]
+            for r in records:
+                if r.step is None:
+                    r.step = step
         return records
 
     @contextmanager
@@ -208,6 +264,41 @@ def timer(name_or_func, **kwargs):
             return func(*args, **kwargs)
 
     return wrapper
+
+
+@contextmanager
+def span_timer(name: str, *, attributes: dict | None = None):
+    """Concurrency-safe phase timer using monotonic duration and wall
+    placement.
+
+    Unlike :func:`timer`, this helper keeps its start state on the stack rather
+    than in the process-global name map, so repeated/nested async-style phase
+    names can coexist without colliding.
+    """
+    start_wall_s = time()
+    started_ns = perf_counter_ns()
+    try:
+        yield
+    finally:
+        ended_ns = perf_counter_ns()
+        Timer().add_complete_span(
+            name,
+            start_wall_s=start_wall_s,
+            end_wall_s=time(),
+            duration_s=(ended_ns - started_ns) / 1e9,
+            attributes=attributes,
+        )
+
+
+@contextmanager
+def timeline_step(step: int):
+    """Bind an immutable step identifier to all spans created in this
+    context."""
+    token = _timeline_step.set(step)
+    try:
+        yield
+    finally:
+        _timeline_step.reset(token)
 
 
 @contextmanager

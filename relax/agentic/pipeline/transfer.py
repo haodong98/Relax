@@ -13,6 +13,7 @@ from relax.agentic.profile import (
     mark_sample_agentic_event_once,
 )
 from relax.engine.rollout.base_types import RolloutFnTrainOutput
+from relax.utils.data.transfer_provenance import TRANSFER_PROVENANCE_KEY, build_transfer_provenance
 from relax.utils.logging_utils import get_logger
 
 
@@ -60,11 +61,34 @@ async def _transfer_batch_to_data_system(
         transfer_samples.append(sample)
     rollout_batch = convert_samples_to_train_data(args, transfer_samples)
     logger.info("Prepared rollout batch %s with %s samples for transfer", batch_count, rollout_batch.numel())
-    logger.info("Transferring batch rollout_batch: %s", rollout_batch)
-    custom_meta = [{"total_lengths": int(length)} for length in rollout_batch["total_lengths"]]
+    logger.info(
+        "Transferring rollout batch %s: samples=%s fields=%s",
+        batch_count,
+        rollout_batch.numel(),
+        sorted(rollout_batch.keys()),
+    )
+    partition_id = f"train_{rollout_id}"
+    custom_meta = []
+    require_provenance = getattr(args, "rm_type", None) == "dual-agentic-judge"
+    for sample, length in zip(transfer_samples, rollout_batch["total_lengths"], strict=True):
+        row_meta: dict = {"total_lengths": int(length)}
+        reward_trace = getattr(sample, "metadata", {}).get("agentic_trace", {}).get("reward")
+        if isinstance(reward_trace, dict) and reward_trace.get("sample_key") and reward_trace.get("group_key"):
+            row_meta[TRANSFER_PROVENANCE_KEY] = build_transfer_provenance(
+                sample_key=reward_trace["sample_key"],
+                group_key=reward_trace["group_key"],
+                partition_id=partition_id,
+                collection_rollout_id=reward_trace.get("collection_rollout_id"),
+                train_partition_rollout_id=reward_trace.get("train_partition_rollout_id"),
+                train_partition_step=reward_trace.get("train_partition_step"),
+                weight_versions=getattr(sample, "weight_versions", None),
+            )
+        elif require_provenance:
+            raise ValueError("dual-agentic-judge sample is missing sample_key/group_key transfer provenance")
+        custom_meta.append(row_meta)
     await data_system_client.async_put(
         data=rollout_batch,
-        partition_id=f"train_{rollout_id}",
+        partition_id=partition_id,
         custom_meta=custom_meta,
         is_last=is_last,
     )
@@ -151,8 +175,17 @@ class TransferDomain:
             target_groups = self._current_partition_quota
         logger.info("Total yielded: %s/%s for step: %s", yielded_groups, target_groups, partition_rollout_id)
         release_started_at = time.time()
+        from relax.utils.metrics.metric_utils import compute_rollout_step
+
+        partition_step = compute_rollout_step(self.args, partition_rollout_id)
         for group in groups:
             for sample in group:
+                agentic_trace = getattr(sample, "metadata", {}).get("agentic_trace", {})
+                reward_trace = agentic_trace.get("reward") if isinstance(agentic_trace, dict) else None
+                if isinstance(reward_trace, dict):
+                    reward_trace["collection_rollout_id"] = self.rollout_id
+                    reward_trace["train_partition_rollout_id"] = partition_rollout_id
+                    reward_trace["train_partition_step"] = partition_step
                 mark_sample_agentic_event(sample, "transfer_release_start_at", release_started_at)
         await _transfer_batch_to_data_system(
             args=self.args,

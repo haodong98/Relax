@@ -6,6 +6,7 @@ from argparse import Namespace
 
 
 GENRM_ROLE = "genrm"
+DEDICATED_JUDGE_ROLES = ("judge_accuracy", "judge_multiturn_vlm")
 
 
 def register_genrm(config: Namespace, algo: dict) -> list[str]:
@@ -41,10 +42,21 @@ def register_sft_rollout(config: Namespace, algo: dict) -> list:
     return [ROLES.rollout]
 
 
+def register_dual_judges(config: Namespace, algo: dict) -> list[str]:
+    if getattr(config, "judge_services", None) is None:
+        return []
+    from relax.components.genrm import GenRM
+
+    for role in DEDICATED_JUDGE_ROLES:
+        algo[role] = GenRM
+    return list(DEDICATED_JUDGE_ROLES)
+
+
 def register_extra_roles(config: Namespace, algo: dict) -> list:
     """Register optional roles and return them in controller iteration
     order."""
     extras = []
     extras.extend(register_genrm(config, algo))
+    extras.extend(register_dual_judges(config, algo))
     extras.extend(register_sft_rollout(config, algo))
     return extras

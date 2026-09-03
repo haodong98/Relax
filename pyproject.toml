@@ -36,6 +36,9 @@ line-ending = "auto"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+markers = [
+    "gpu: opt-in tests that require local GPU models and the target Ray/SGLang runtime",
+]
 
 [tool.versioneer]
 VCS = "git"

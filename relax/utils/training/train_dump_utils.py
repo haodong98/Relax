@@ -1,17 +1,236 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import copy
+import hashlib
 import json
+import os
+import socket
+import time
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Dict, List
 
 import torch
 from PIL import Image
 
+from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
 from relax.utils.multimodal.stats import get_sample_multimodal_stats
 
 
 logger = get_logger(__name__)
+_DIGEST_MODULUS = 1 << 256
+
+
+def _dual_judge_marker_dir(args: Any) -> Path | None:
+    marker_dir = Envs.RELAX_DUAL_JUDGE_MARKER_DIR
+    if (
+        marker_dir is None
+        or getattr(args, "rm_type", None) != "dual-agentic-judge"
+        or getattr(args, "judge_services", None) is None
+    ):
+        return None
+    return Path(marker_dir)
+
+
+def _append_marker_record(path: Path, record: dict[str, Any]) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+    except Exception as exc:
+        logger.warning("Failed to append critical-path marker to %s: %s", path, exc)
+
+
+def append_weight_serving_ready_marker(
+    args: Any,
+    *,
+    step: int,
+    wall_time_s: float,
+    monotonic_ns: int,
+) -> None:
+    """Append one low-volume ready boundary usable with timeline tracing
+    disabled."""
+    marker_dir = _dual_judge_marker_dir(args)
+    if marker_dir is None:
+        return
+    judge_services = getattr(args, "judge_services", None)
+    benchmark_mode = getattr(judge_services, "benchmark_mode", None)
+    from relax.utils.judge_config import dual_judge_benchmark_invariant_hash
+
+    invariant_hash = dual_judge_benchmark_invariant_hash(args)
+    record = {
+        "schema_version": 1,
+        "event": "weight_serving_ready",
+        "step": step,
+        "wall_time_s": wall_time_s,
+        "monotonic_ns": monotonic_ns,
+        "clock_host": socket.gethostname(),
+        "pid": os.getpid(),
+        "benchmark_mode": benchmark_mode,
+        "benchmark_invariant_hash": invariant_hash,
+        "timeline_enabled": bool(
+            getattr(args, "use_metrics_service", False) and getattr(args, "timeline_dump_dir", None)
+        ),
+    }
+    _append_marker_record(marker_dir / "weight_serving_ready.jsonl", record)
+
+
+def append_agentic_accounting_marker(args: Any, *, step: int, snapshot: dict[str, Any]) -> None:
+    """Persist the terminal dataflow snapshot used to reject right-censored
+    runs."""
+    marker_dir = _dual_judge_marker_dir(args)
+    if marker_dir is None:
+        return
+    record = {
+        "schema_version": 1,
+        "event": "agentic_accounting_end",
+        "step": step,
+        "wall_time_s": time.time(),
+        "clock_host": socket.gethostname(),
+        "pid": os.getpid(),
+        "snapshot": copy.deepcopy(snapshot),
+    }
+    _append_marker_record(marker_dir / "agentic_accounting_end.jsonl", record)
+
+
+def _reward_marker_metadata(
+    samples: list[Any],
+    reward_trace_snapshots: list[dict[str, Any]],
+) -> list[tuple[dict[str, Any], bool]]:
+    records = [
+        (sample.metadata if isinstance(getattr(sample, "metadata", None), dict) else {}, False) for sample in samples
+    ]
+    committed_keys = {
+        repr(reward_trace.get("sample_key"))
+        for metadata, _is_snapshot in records
+        if isinstance((trace := metadata.get("agentic_trace")), dict)
+        and isinstance((reward_trace := trace.get("reward")), dict)
+        and reward_trace.get("sample_key") is not None
+    }
+    for snapshot in reward_trace_snapshots:
+        if not isinstance(snapshot, dict):
+            continue
+        trace = snapshot.get("agentic_trace")
+        reward_trace = trace.get("reward") if isinstance(trace, dict) else None
+        snapshot_key = repr(reward_trace.get("sample_key")) if isinstance(reward_trace, dict) else None
+        if snapshot_key is not None and snapshot_key in committed_keys:
+            continue
+        records.append((snapshot, True))
+    return records
+
+
+def _counter_to_json(counter: Counter[str]) -> dict[str, int]:
+    return {key: counter[key] for key in sorted(counter)}
+
+
+def append_reward_workload_markers(
+    args: Any,
+    *,
+    collection_rollout_id: int,
+    default_step: int,
+    committed_samples: list[Any],
+    reward_trace_snapshots: list[dict[str, Any]],
+) -> None:
+    """Append mergeable per-partition workload evidence without serializing
+    trajectories."""
+    marker_dir = _dual_judge_marker_dir(args)
+    if marker_dir is None:
+        return
+    from relax.utils.judge_config import dual_judge_benchmark_invariant_hash
+
+    invariant_hash = dual_judge_benchmark_invariant_hash(args)
+    fragments: defaultdict[int, list[tuple[dict[str, Any], bool]]] = defaultdict(list)
+    for metadata, is_snapshot in _reward_marker_metadata(committed_samples, reward_trace_snapshots):
+        trace = metadata.get("agentic_trace")
+        reward_trace = trace.get("reward") if isinstance(trace, dict) else None
+        partition_step = reward_trace.get("train_partition_step") if isinstance(reward_trace, dict) else None
+        if isinstance(partition_step, bool) or not isinstance(partition_step, int):
+            partition_step = default_step
+        fragments[partition_step].append((metadata, is_snapshot))
+
+    for partition_step, metadata_records in fragments.items():
+        identity_sum = 0
+        identity_xor = 0
+        invalid_identity_count = 0
+        invalid_recorded_reward_hash_count = 0
+        group_sample_counts: Counter[int] = Counter()
+        outcome_counts: Counter[str] = Counter()
+        mode_counts: Counter[str] = Counter()
+        branch_signature_counts: Counter[str] = Counter()
+        terminal_snapshot_count = 0
+        for metadata, is_snapshot in metadata_records:
+            terminal_snapshot_count += int(is_snapshot)
+            trace = metadata.get("agentic_trace")
+            reward_trace = trace.get("reward") if isinstance(trace, dict) else None
+            reward_trace = reward_trace if isinstance(reward_trace, dict) else {}
+            group_index = reward_trace.get("group_index")
+            sample_index = reward_trace.get("sample_index")
+            context_hash = reward_trace.get("context_hash")
+            recorded_reward_hash = reward_trace.get("recorded_reward_hash")
+            identity_is_valid = (
+                isinstance(group_index, int)
+                and not isinstance(group_index, bool)
+                and isinstance(sample_index, int)
+                and not isinstance(sample_index, bool)
+                and isinstance(context_hash, str)
+                and bool(context_hash)
+            )
+            if identity_is_valid:
+                group_sample_counts[group_index] += 1
+            else:
+                invalid_identity_count += 1
+            if reward_trace.get("benchmark_mode") in {"recorded", "accuracy_shadow", "dual_shadow"} and not (
+                isinstance(recorded_reward_hash, str) and recorded_reward_hash
+            ):
+                invalid_recorded_reward_hash_count += 1
+            canonical_identity = json.dumps(
+                [group_index, sample_index, context_hash, recorded_reward_hash],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            identity_value = int.from_bytes(hashlib.sha256(canonical_identity).digest(), "big")
+            identity_sum = (identity_sum + identity_value) % _DIGEST_MODULUS
+            identity_xor ^= identity_value
+            outcome_key = json.dumps(
+                [
+                    reward_trace.get("pipeline_status"),
+                    reward_trace.get("executor_status"),
+                    reward_trace.get("terminal_outcome"),
+                ],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            outcome_counts[outcome_key] += 1
+            mode_counts[str(reward_trace.get("benchmark_mode"))] += 1
+            judges = reward_trace.get("judges")
+            branch_signature = []
+            if isinstance(judges, dict):
+                branch_signature = sorted(
+                    [component, value.get("status") if isinstance(value, dict) else None]
+                    for component, value in judges.items()
+                )
+            branch_signature_counts[json.dumps(branch_signature, ensure_ascii=False, separators=(",", ":"))] += 1
+        record = {
+            "schema_version": 1,
+            "event": "reward_workload_fragment",
+            "step": partition_step,
+            "collection_rollout_id": collection_rollout_id,
+            "identity_count": len(metadata_records),
+            "identity_digest_sum": f"{identity_sum:064x}",
+            "identity_digest_xor": f"{identity_xor:064x}",
+            "invalid_identity_count": invalid_identity_count,
+            "invalid_recorded_reward_hash_count": invalid_recorded_reward_hash_count,
+            "group_sample_counts": [[group, group_sample_counts[group]] for group in sorted(group_sample_counts)],
+            "reward_outcome_counts": _counter_to_json(outcome_counts),
+            "benchmark_mode_counts": _counter_to_json(mode_counts),
+            "judge_branch_signature_counts": _counter_to_json(branch_signature_counts),
+            "terminal_snapshot_count": terminal_snapshot_count,
+            "benchmark_invariant_hash": invariant_hash,
+            "clock_host": socket.gethostname(),
+            "pid": os.getpid(),
+        }
+        _append_marker_record(marker_dir / "reward_workload.jsonl", record)
 
 
 def _decode_tokens_to_chars(tokens: List[int], tokenizer) -> List[str]:
@@ -192,6 +411,36 @@ def _summarize_multimodal_train_inputs(mm_train_inputs: dict) -> dict:
     return summary
 
 
+def _compact_latency_trace(metadata: dict) -> dict | None:
+    agentic_trace = metadata.get("agentic_trace")
+    reward_trace = agentic_trace.get("reward") if isinstance(agentic_trace, dict) else None
+    if not isinstance(reward_trace, dict):
+        return None
+    turns = agentic_trace.get("turns")
+    compact_trace = {
+        "events": copy.deepcopy(agentic_trace.get("events", {})),
+        "reward": copy.deepcopy(reward_trace),
+        "turns": [
+            {
+                key: copy.deepcopy(turn[key])
+                for key in ("generation_elapsed_s", "wall_elapsed_s", "events")
+                if key in turn
+            }
+            for turn in (turns if isinstance(turns, list) else [])
+            if isinstance(turn, dict)
+        ],
+    }
+    assistant_turn_count = agentic_trace.get("per_turn_assistant_turn_count")
+    if isinstance(assistant_turn_count, int) and not isinstance(assistant_turn_count, bool):
+        compact_trace["per_turn_assistant_turn_count"] = assistant_turn_count
+    if agentic_trace.get("reasoning_trigger") == "per_turn":
+        off_lineage_count = agentic_trace.get("per_turn_off_lineage_judge_count", 0)
+        if not isinstance(off_lineage_count, int) or isinstance(off_lineage_count, bool) or off_lineage_count < 0:
+            raise ValueError("agentic_trace.per_turn_off_lineage_judge_count must be a non-negative integer")
+        compact_trace["per_turn_off_lineage_judge_count"] = off_lineage_count
+    return compact_trace
+
+
 def _sample_to_summary_record(sample, rollout_id: int, idx: int, dataset_name: str | None = None) -> dict:
     total_length = len(sample.tokens) if sample.tokens else 0
     response_length = sample.response_length
@@ -216,6 +465,7 @@ def _sample_to_summary_record(sample, rollout_id: int, idx: int, dataset_name: s
         "agent_turns": metadata.get("rollout_turns", 1),
         "status": sample.status.value if hasattr(sample.status, "value") else str(sample.status),
         "group_index": sample.group_index,
+        "weight_versions": list(getattr(sample, "weight_versions", []) or []),
     }
     if sample.label is not None:
         record["label"] = sample.label
@@ -225,7 +475,29 @@ def _sample_to_summary_record(sample, rollout_id: int, idx: int, dataset_name: s
         record["multimodal_train_inputs"] = _summarize_multimodal_train_inputs(sample.multimodal_train_inputs)
     if dataset_name is not None:
         record["dataset"] = dataset_name
+    latency_trace = _compact_latency_trace(metadata)
+    if latency_trace is not None:
+        record["latency_trace"] = latency_trace
     return record
+
+
+def _reward_snapshot_to_summary_record(metadata: dict, rollout_id: int, idx: int) -> dict | None:
+    latency_trace = _compact_latency_trace(metadata)
+    if latency_trace is None:
+        return None
+    reward_trace = latency_trace["reward"]
+    return {
+        "record_type": "reward_terminal_trace",
+        "rollout_id": rollout_id,
+        "collection_rollout_id": rollout_id,
+        "trace_index": idx,
+        "sample_index": reward_trace.get("sample_index", idx),
+        "group_index": reward_trace.get("group_index"),
+        "sample_key": copy.deepcopy(reward_trace.get("sample_key")),
+        "group_key": copy.deepcopy(reward_trace.get("group_key")),
+        "status": reward_trace.get("terminal_outcome", reward_trace.get("pipeline_status", "unknown")),
+        "latency_trace": latency_trace,
+    }
 
 
 def _write_summary_jsonl(path: Path, records: list[dict]) -> None:
@@ -258,6 +530,43 @@ def save_rollout_result_jsonl(args, rollout_id: int, samples: list) -> None:
         logger.info(f"Saved rollout result ({len(records)} samples) to {path}")
     except Exception as e:
         logger.warning(f"Failed to save rollout result to {path}: {e}")
+
+
+def save_reward_trace_snapshots_jsonl(
+    args,
+    rollout_id: int,
+    snapshots: list[dict],
+    *,
+    committed_samples: list | None = None,
+) -> None:
+    """Persist terminal reward attempts separately from real rollout
+    samples."""
+    result_dir = getattr(args, "rollout_result_dir", None)
+    if result_dir is None or not snapshots:
+        return
+    committed_keys = {
+        repr(trace.get("reward", {}).get("sample_key"))
+        for sample in committed_samples or []
+        if isinstance((trace := getattr(sample, "metadata", {}).get("agentic_trace")), dict)
+    }
+    records = []
+    for index, metadata in enumerate(snapshots):
+        if not isinstance(metadata, dict):
+            continue
+        latency_trace = _compact_latency_trace(metadata)
+        if latency_trace is None or repr(latency_trace["reward"].get("sample_key")) in committed_keys:
+            continue
+        record = _reward_snapshot_to_summary_record(metadata, rollout_id, index)
+        if record is not None:
+            records.append(record)
+    if not records:
+        return
+    path = Path(result_dir) / "reward_terminal_traces" / f"{rollout_id}.jsonl"
+    try:
+        _write_summary_jsonl(path, records)
+        logger.info(f"Saved terminal reward traces ({len(records)} samples) to {path}")
+    except Exception as e:
+        logger.warning(f"Failed to save terminal reward traces to {path}: {e}")
 
 
 def save_eval_summary_jsonl(args, rollout_id: int, data: dict) -> None:

@@ -1,5 +1,8 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
 # Adapted from https://github.com/OpenRLHF/OpenRLHF/blob/10c733694ed9fbb78a0a2ff6a05efc7401584d46/openrlhf/trainer/ray/utils.py#L1
 import os
+from collections.abc import Mapping
 
 import ray
 
@@ -28,6 +31,14 @@ NOSET_VISIBLE_DEVICES_ENV_VARS_LIST = [
 
 def ray_noset_visible_devices(env_vars=os.environ):
     return any(env_vars.get(env_var) for env_var in NOSET_VISIBLE_DEVICES_ENV_VARS_LIST)
+
+
+def propagate_allowlisted_env_vars(env_vars: dict[str, str], source: Mapping[str, str] = os.environ) -> None:
+    """Copy explicitly allow-listed variables into a nested Ray runtime env."""
+    for name in source.get("RELAX_PROPAGATE_ENV_VARS", "").split(","):
+        name = name.strip()
+        if name and (value := source.get(name)) is not None:
+            env_vars[name] = value
 
 
 def get_physical_gpu_id():

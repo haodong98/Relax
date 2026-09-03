@@ -192,6 +192,9 @@ class Envs(metaclass=_EnvsMeta):
 
     # ------------- Telemetry / Log -------------
     RELAX_TELEMETRY_HOOK = EnvProperty("RELAX_TELEMETRY_HOOK", str, None)
+    RELAX_DUAL_JUDGE_MARKER_DIR = EnvProperty("RELAX_DUAL_JUDGE_MARKER_DIR", str, None)
+    RELAX_JUDGE_GPU_SAMPLE_DIR = EnvProperty("RELAX_JUDGE_GPU_SAMPLE_DIR", str, None)
+    RELAX_JUDGE_GPU_SAMPLE_INTERVAL_S = EnvProperty("RELAX_JUDGE_GPU_SAMPLE_INTERVAL_S", float, 0.2)
     LOG_LEVEL = EnvProperty("LOG_LEVEL", str, "INFO")
     # Ray's own knob; it accepts "1" and "legacy", so it stays a string rather
     # than a bool to avoid rejecting a value Ray itself considers valid.

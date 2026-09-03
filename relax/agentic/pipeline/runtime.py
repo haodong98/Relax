@@ -1320,6 +1320,13 @@ class ManagedSessionRunnerPool:
         return [dict(item) for item in snapshots if isinstance(item, dict)]
 
 
+# The MobileGym G1 CPU sweep observed 125.84 host CPU cores at 64 concurrent
+# browser episodes (1.97 cores/episode). Reserve that measured saturated-load
+# requirement per launch slot so Ray admission reflects the subprocesses a
+# ManagedSessionRunner owns instead of treating them as nearly CPU-free.
+_SESSION_RUNNER_CPUS_PER_LAUNCH_SLOT = 2
+
+
 def create_managed_session_runner_pool(args: Any, *, total_requests: int) -> ManagedSessionRunnerPool | None:
     resources = get_agentic_runtime_resources(args)
 
@@ -1327,8 +1334,7 @@ def create_managed_session_runner_pool(args: Any, *, total_requests: int) -> Man
         handles = []
         for runner_id, launch_capacity in enumerate(capacities):
             handle = ManagedSessionRunner.options(
-                # Require a *tiny* CPU reservation so runners cannot land on the head node
-                num_cpus=0.01,
+                num_cpus=max(1, launch_capacity * _SESSION_RUNNER_CPUS_PER_LAUNCH_SLOT),
                 scheduling_strategy="SPREAD",
             ).remote(runner_id=runner_id, launch_capacity=launch_capacity)
             handles.append(handle)
@@ -1919,6 +1925,13 @@ class RuntimeDomain:
         dropped_slots = self._drop_runtime_group_slots(group_key=group_key)
         self._drop_materialized_group_state(group_key=group_key)
         await self._discard_runtime_slots(dropped_slots)
+
+    async def drop_groups_by_key(self, group_keys: set[GroupKey]) -> int:
+        """Idempotently discard all runtime/materialization state for
+        groups."""
+        for group_key in group_keys:
+            await self._drop_runtime_group_resources(group_key=group_key)
+        return len(group_keys)
 
     async def _drain_finished_runtime_slot_materializations(self) -> str | None:
         done_tasks = [

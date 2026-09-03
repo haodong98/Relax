@@ -1,12 +1,14 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import dataclasses
+import fcntl
 import ipaddress
 import multiprocessing
 import os
 import signal
 import threading
 import time
+from pathlib import Path
 from typing import Optional
 from urllib.parse import quote, urlsplit
 
@@ -25,6 +27,7 @@ from relax.utils.env import Envs
 from relax.utils.http_utils import get_host_info, router_worker_base_url
 from relax.utils.logging_utils import get_logger
 from relax.utils.megatron_peft_utils import convert_megatron_to_hf_target_modules, is_lora_enabled
+from relax.utils.metrics.judge_gpu_sampler import JudgeGpuSampler
 
 
 logger = get_logger(__name__)
@@ -42,6 +45,23 @@ _MIN_HTTP_TIMEOUT_S = 1.0
 # than "the server is briefly busy". Bail out instead of retrying until the
 # drain deadline: a dead engine will never answer.
 _MAX_CONSECUTIVE_CONNECT_ERRORS = 3
+
+
+def _validate_flashinfer_workspace() -> str | None:
+    """Verify an explicitly configured FlashInfer workspace inside the
+    actor."""
+    configured = os.environ.get("FLASHINFER_WORKSPACE_BASE")
+    if not configured:
+        return None
+    workspace = Path(configured).resolve()
+    if not workspace.is_dir():
+        raise RuntimeError(f"FLASHINFER_WORKSPACE_BASE is not a directory in SGLangEngine: {workspace}")
+    probe = workspace / ".relax_actor_flock_probe"
+    with probe.open("a+b") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+    logger.info(f"Validated actor-local FlashInfer workspace: {workspace}")
+    return str(workspace)
 
 
 def get_base_gpu_id(args, rank):
@@ -255,6 +275,7 @@ class SGLangEngine(RayActor):
         self._is_weight_updating: bool = False
         self._router_worker_id: str | None = None
         self._router_unregister_submitted = False
+        self._judge_gpu_sampler: JudgeGpuSampler | None = None
         if register_sigterm_handler:
             self._register_sigterm_handler()
 
@@ -346,6 +367,7 @@ class SGLangEngine(RayActor):
                 before accepting requests. The caller must call register_to_router()
                 after weight sync completes.
         """
+        _validate_flashinfer_workspace()
         self.router_ip = router_ip if router_ip is not None else self.args.sglang_router_ip
         self.router_port = router_port if router_port is not None else self.args.sglang_router_port
         self._skip_router_registration = skip_router_registration
@@ -365,6 +387,7 @@ class SGLangEngine(RayActor):
         host = _format_v6_uri(host)
         ip_part, port_part = dist_init_addr.rsplit(":", 1)
         dist_init_addr = f"{_format_v6_uri(ip_part)}:{port_part}"
+        self.dist_init_addr = dist_init_addr
 
         server_args_dict, external_engine_need_check_fields = _compute_server_args(
             self.args,
@@ -492,6 +515,46 @@ class SGLangEngine(RayActor):
         # Only register to router if skip_router_registration=False
         if not self._skip_router_registration:
             self.register_to_router(bootstrap_port=bootstrap_port)
+
+        self._maybe_start_judge_gpu_sampler()
+
+    def _maybe_start_judge_gpu_sampler(self) -> None:
+        """Start the background NVML/SGLang occupancy sampler for this engine
+        shard, gated on ``RELAX_JUDGE_GPU_SAMPLE_DIR`` so it is zero-overhead
+        when unset.
+
+        This runs from the one init path shared by plain rollout engines and
+        GenRM/judge engines, so both get sampled; the emitted ``role`` field
+        (``"rollout"`` vs. ``genrm_role``) is what a consumer filters on. See
+        examples/agentic_dual_judge/README.md.
+        """
+        sample_dir = Envs.RELAX_JUDGE_GPU_SAMPLE_DIR
+        if not sample_dir or self.base_gpu_id is None:
+            return
+        if isinstance(self, GenRMEngine):
+            role = getattr(self.args, "genrm_role", "genrm")
+            num_gpus_per_engine = getattr(self.args, "genrm_num_gpus_per_engine", None) or 1
+            model_path = getattr(self.args, "genrm_model_path", None)
+        else:
+            role = "rollout"
+            num_gpus_per_engine = self.num_gpus_per_engine or 1
+            model_path = getattr(self.args, "hf_checkpoint", None)
+        # Only node_rank 0 runs a local SGLang HTTP server (see _make_request/get_url);
+        # other shards of a multi-node engine still get NVML-only sampling.
+        scrape_url = f"http://{self.server_host}:{self.server_port}/metrics" if self.node_rank == 0 else None
+        self._judge_gpu_sampler = JudgeGpuSampler(
+            role=role,
+            engine_rank=self.rank,
+            base_gpu_id=self.base_gpu_id,
+            num_gpus_per_engine=num_gpus_per_engine,
+            model_path=model_path,
+            scrape_url=scrape_url,
+            sample_dir=sample_dir,
+            server_host=self.server_host,
+            dist_init_addr=getattr(self, "dist_init_addr", None),
+            interval_s=Envs.RELAX_JUDGE_GPU_SAMPLE_INTERVAL_S,
+        )
+        self._judge_gpu_sampler.start()
 
     def _make_request(self, endpoint: str, payload: dict | None = None, timeout: float | None = None):
         """Make a POST request to the specified endpoint with the given
@@ -686,6 +749,10 @@ class SGLangEngine(RayActor):
             time.sleep(1)
 
     def shutdown(self):
+        if self._judge_gpu_sampler is not None:
+            self._judge_gpu_sampler.stop()
+            self._judge_gpu_sampler = None
+
         if self.args.rollout_external:
             return
 
@@ -716,6 +783,14 @@ class SGLangEngine(RayActor):
         if self.node_rank != 0:
             return None
         return f"http://{self.server_host}:{self.server_port}"
+
+    def get_gpu_sample_snapshot(self) -> dict | None:
+        """Return the judge/rollout GPU occupancy sampler's cumulative
+        accumulators, or None if sampling is disabled
+        (``RELAX_JUDGE_GPU_SAMPLE_DIR`` unset) for this engine shard."""
+        if self._judge_gpu_sampler is None:
+            return None
+        return self._judge_gpu_sampler.snapshot()
 
     def get_pid_and_node_id(self) -> dict:
         """Return the PID and Ray node ID of this engine.
@@ -1047,8 +1122,38 @@ class GenRMEngine(SGLangEngine):
     specific arguments (model path, GPU count, sampling parameters, etc.).
     """
 
+    def get_runtime_identity(self) -> dict:
+        """Return runtime facts needed to validate a dedicated Judge engine."""
+        return {
+            "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+            "ld_library_path": os.environ.get("LD_LIBRARY_PATH"),
+            "flashinfer_workspace_base": os.environ.get("FLASHINFER_WORKSPACE_BASE"),
+            "ray_gpu_ids": ray.get_gpu_ids(),
+        }
+
+    @staticmethod
+    def _restore_cudnn_overlay_path() -> None:
+        """Restore the driver-selected cuDNN overlay before spawning SGLang.
+
+        Some imports in the container interpreter prepend OpenCV's bundled
+        libraries to ``LD_LIBRARY_PATH`` inside a Ray actor.  The SGLang server
+        is a child process of this actor, so normalize the path here rather
+        than relying on the driver's runtime environment surviving imports.
+        """
+        cudnn_dir = os.environ.get("CUDNN_LIB_DIR")
+        if not cudnn_dir:
+            return
+        if not os.path.isdir(cudnn_dir):
+            raise RuntimeError(f"CUDNN_LIB_DIR does not exist in GenRMEngine: {cudnn_dir}")
+        existing = [
+            entry for entry in os.environ.get("LD_LIBRARY_PATH", "").split(":") if entry and entry != cudnn_dir
+        ]
+        os.environ["LD_LIBRARY_PATH"] = ":".join([cudnn_dir, *existing])
+
     def init(self, dist_init_addr, port, nccl_port, host=None, disaggregation_bootstrap_port=None):
         """Initialize the genRM engine with genrm-specific arguments."""
+        _validate_flashinfer_workspace()
+        self._restore_cudnn_overlay_path()
         self.router_ip = ""
         self.router_port = 0
         self._skip_router_registration = True
@@ -1068,6 +1173,7 @@ class GenRMEngine(SGLangEngine):
         host = _format_v6_uri(host)
         ip_part, port_part = dist_init_addr.rsplit(":", 1)
         dist_init_addr = f"{_format_v6_uri(ip_part)}:{port_part}"
+        self.dist_init_addr = dist_init_addr
 
         server_args_dict, external_engine_need_check_fields = _compute_genrm_server_args(
             self.args,
@@ -1271,7 +1377,12 @@ def _compute_genrm_server_args(
     # not recognized by the installed SGLang ServerArgs are dropped with a
     # warning rather than causing a TypeError at ServerArgs(**kwargs).
     server_arg_fields = {f.name for f in dataclasses.fields(ServerArgs)}
-    for key, value in (args.genrm_engine_config or {}).items():
+    engine_overrides = dict(args.genrm_engine_config or {})
+    if "max_context_len" in engine_overrides:
+        # Public judge config uses a backend-neutral name; SGLang calls the
+        # model context-window limit ``context_length``.
+        engine_overrides["context_length"] = engine_overrides.pop("max_context_len")
+    for key, value in engine_overrides.items():
         if key not in server_arg_fields:
             logger.info(
                 f"Warning: --genrm-engine-config key {key!r} is not a ServerArgs field in the "

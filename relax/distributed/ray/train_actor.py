@@ -3,6 +3,7 @@
 import abc
 import os
 import random
+import socket
 from datetime import timedelta
 
 import ray
@@ -18,6 +19,7 @@ from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
 from relax.utils.memory_utils import clear_memory, print_memory
 from relax.utils.memory_utils import set_role as set_memory_role
+from relax.utils.metrics.judge_gpu_sampler import JudgeGpuSampler
 
 
 logger = get_logger(__name__)
@@ -52,6 +54,7 @@ class TrainRayActor(RayActor):
         # os.environ.pop("CUDA_VISIBLE_DEVICES", None)
         # os.environ["LOCAL_RANK"] = str(ray.get_gpu_ids()[0])
         os.environ["LOCAL_RANK"] = str(get_local_gpu_id())
+        self._actor_gpu_sampler: JudgeGpuSampler | None = None
 
     def init(self, args, role, with_ref=False, with_opd_teacher=False):
         self.args = args
@@ -78,6 +81,42 @@ class TrainRayActor(RayActor):
 
         numa_local_rank = Envs.RANK % args.num_gpus_per_node
         device_utils.set_numa_affinity(numa_local_rank)
+
+        self._maybe_start_actor_gpu_sampler()
+
+    def _maybe_start_actor_gpu_sampler(self) -> None:
+        """Start the background NVML occupancy sampler for this train-actor
+        rank, gated on ``RELAX_JUDGE_GPU_SAMPLE_DIR`` so it is zero-overhead
+        when unset.
+
+        Mirrors ``SGLangEngine._maybe_start_judge_gpu_sampler`` (see
+        relax/backends/sglang/sglang_engine.py), whose sampler only covers
+        judge/rollout inference engines -- the trainer's own GPU idleness was
+        previously inferred from `critical_path.data_wait` never overlapping
+        `optimizer_step`/`weight_update`, not directly measured.
+        ``role="actor"`` distinguishes these JSONL files from the judge/rollout
+        ones written into the same directory. There is no SGLang HTTP endpoint
+        to scrape here, so ``scrape_url`` is always None -- only the NVML half
+        of the sampler is active.
+        """
+        sample_dir = Envs.RELAX_JUDGE_GPU_SAMPLE_DIR
+        if not sample_dir:
+            return
+        device_ids = ray_get_device_ids()
+        if not device_ids:
+            return
+        self._actor_gpu_sampler = JudgeGpuSampler(
+            role="actor",
+            engine_rank=self.args.rank,
+            base_gpu_id=int(device_ids[0]),
+            num_gpus_per_engine=max(1, len(device_ids)),
+            model_path=getattr(self.args, "hf_checkpoint", None),
+            scrape_url=None,
+            sample_dir=sample_dir,
+            server_host=socket.gethostname(),
+            interval_s=Envs.RELAX_JUDGE_GPU_SAMPLE_INTERVAL_S,
+        )
+        self._actor_gpu_sampler.start()
 
     def clear_memory(self):
         print_memory("before TrainRayActor.clear_memory")

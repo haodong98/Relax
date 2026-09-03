@@ -59,7 +59,8 @@ from relax.utils.training.train_dump_utils import (
 from relax.utils.types import Sample
 from relax.utils.utils import get_ray_accelerator_kwargs
 
-from .utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, Lock
+from .placement_group import _validate_rollout_engine_node_blocks
+from .utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, Lock, propagate_allowlisted_env_vars
 
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -502,6 +503,11 @@ class EngineGroup:
                     "SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2": "0",
                 }.items()
             }
+            # Each SGLangEngine declares an explicit runtime_env, so copy the
+            # driver's allow-listed overlays instead of relying on outer Ray
+            # job inheritance. This includes the node-local FlashInfer JIT
+            # workspace used by latency experiments.
+            propagate_allowlisted_env_vars(env_vars)
             if getattr(self.args, "fp16", False):
                 env_vars["SGLANG_MAMBA_CONV_DTYPE"] = "float16"
 
@@ -3556,6 +3562,19 @@ def _allocate_rollout_engine_addr_and_ports_normal(
     _gpus_per_engine = num_gpus_per_engine or args.rollout_num_gpus_per_engine
     num_engines_per_node = max(1, args.num_gpus_per_node // _gpus_per_engine)
     addr_and_ports: dict[int, dict] = {}
+
+    # The allocator below intentionally assigns one node anchor to each
+    # predicted contiguous rank block. Verify that Ray actually honoured that
+    # layout before any SGLang process enters TCPStore. This converts a
+    # fragmented PG (for example 2/4/2 bundles across three nodes) from a
+    # 600-second rendezvous hang into an immediate, actionable failure.
+    node_probe_results = ray.get([engine._get_current_node_ip_and_free_port.remote() for _, engine in rollout_engines])
+    rank_to_actual_ip = {rank: str(node_probe_results[index][0]) for index, (rank, _) in enumerate(rollout_engines)}
+    _validate_rollout_engine_node_blocks(
+        rank_to_actual_ip,
+        rank_offset=rank_offset,
+        num_engines_per_node=num_engines_per_node,
+    )
 
     # Track per-node port cursors so that different engine groups (called
     # sequentially) never race for the same ports on a given node.

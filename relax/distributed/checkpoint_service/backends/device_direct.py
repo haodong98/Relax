@@ -33,8 +33,9 @@ from urllib3.exceptions import NewConnectionError
 
 from relax.backends.megatron.weight_conversion import convert_to_hf
 from relax.backends.megatron.weight_update.common import all_gather_param, named_params_and_buffers
-from relax.backends.megatron.weight_update.hf_weight_iterator_bridge import _adapter_base_prefix, _base_param_prefix
 from relax.backends.megatron.weight_update.lora_adapter_sync import LoraAdapterSync
+from relax.backends.megatron.weight_update.lora_names import adapter_base_prefix as _adapter_base_prefix
+from relax.backends.megatron.weight_update.lora_names import base_param_prefix as _base_param_prefix
 from relax.distributed.checkpoint_service.backends.base import CommBackend, TensorFusion
 from relax.distributed.checkpoint_service.config import BackendType, RoleInfo
 from relax.distributed.checkpoint_service.utils import load_weight
@@ -183,7 +184,13 @@ class DeviceDirectBackend(CommBackend):
             self.rollout_engines[int(rank)] = actor
             logger.info(f"Created RolloutEngine actor for rank {rank}")
 
-    def _batch_request(self, endpoint: str, payload: Optional[Dict] = None, get_rank: bool = False) -> List[Any]:
+    def _batch_request(
+        self,
+        endpoint: str,
+        payload: Optional[Dict] = None,
+        get_rank: bool = False,
+        timeout_s: Optional[float] = None,
+    ) -> List[Any]:
         """Send HTTP requests to all rollout engines and collect futures.
 
         Args:
@@ -204,7 +211,7 @@ class DeviceDirectBackend(CommBackend):
                 payload_cur = payload.get(int(rank), {}) if payload else None
             else:
                 payload_cur = payload
-            future = engine.make_request.remote(endpoint, payload_cur)
+            future = engine.make_request.remote(endpoint, payload_cur, timeout_s)
             futures.append(future)
         return futures
 
@@ -658,11 +665,22 @@ class DeviceDirectBackend(CommBackend):
             self._lora_sync.base_sync_done = True
 
         if not actor_fwd_only:
+            resume_error = None
+            resume_timeout_s = float(getattr(self.args, "rollout_http_timeout", 30.0))
             if dist.get_rank() == 0:
                 # Continue generation on all rollout nodes
                 logger.info("Resuming generation on all rollout nodes...")
-                self._batch_request("/continue_generation")
-            dist.barrier(group=get_gloo_group())
+                try:
+                    ray.get(
+                        self._batch_request("/continue_generation", timeout_s=resume_timeout_s),
+                        timeout=resume_timeout_s + 5.0,
+                    )
+                except Exception as exc:
+                    resume_error = f"continue_generation failed: {type(exc).__name__}: {exc}"
+            resume_status = [resume_error]
+            dist.broadcast_object_list(resume_status, src=0, group=get_gloo_group())
+            if resume_status[0] is not None:
+                raise RuntimeError(resume_status[0])
             # NOTE: rollout proxy actors are intentionally kept alive across weight
             # updates so init_process_group_for_rollout can reuse them (and the NCCL
             # group) when the topology is unchanged. They are torn down only when the
@@ -1074,7 +1092,12 @@ class RolloutEngine:
         response.raise_for_status()
         return True
 
-    def make_request(self, endpoint: str, payload: Optional[Dict] = None) -> Any:
+    def make_request(
+        self,
+        endpoint: str,
+        payload: Optional[Dict] = None,
+        timeout_s: Optional[float] = None,
+    ) -> Any:
         """Send a synchronous HTTP POST to the rollout node and return JSON.
 
         Args:
@@ -1086,7 +1109,7 @@ class RolloutEngine:
         """
         endpoint = endpoint.lstrip("/")
         url = f"{self.base_url}/{endpoint}"
-        response = requests.post(url, json=payload or {})
+        response = requests.post(url, json=payload or {}, timeout=timeout_s)
         try:
             response.raise_for_status()
         except requests.exceptions.HTTPError as e:

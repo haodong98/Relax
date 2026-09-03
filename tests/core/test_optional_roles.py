@@ -2,7 +2,9 @@
 
 """Optional role registration helpers."""
 
+import sys
 from argparse import Namespace
+from types import ModuleType
 
 import pytest
 
@@ -44,3 +46,15 @@ def test_register_sft_rollout_noop_for_non_sft_algorithms():
 
     assert register_sft_rollout(config, algo) == []
     assert algo == {}
+
+
+def test_register_dual_judges_adds_two_fixed_roles(monkeypatch):
+    from relax.core.optional_roles import register_dual_judges
+
+    genrm_module = ModuleType("relax.components.genrm")
+    genrm_module.GenRM = object()
+    monkeypatch.setitem(sys.modules, "relax.components.genrm", genrm_module)
+    algo = {}
+    roles = register_dual_judges(Namespace(judge_services=object()), algo)
+    assert roles == ["judge_accuracy", "judge_multiturn_vlm"]
+    assert set(algo) == set(roles)

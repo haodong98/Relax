@@ -1,10 +1,12 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import json
 import os
 import threading
 import time
 from argparse import Namespace
-from typing import Any, Optional
+from pathlib import Path
+from typing import Any, List, Optional
 
 import ray
 import requests
@@ -19,6 +21,12 @@ from relax.utils.utils import get_ray_accelerator_kwargs, get_serve_url, recover
 
 
 logger = get_logger(__name__)
+
+
+# A placement group that cannot schedule has no useful recovery path inside a
+# service constructor. Bound readiness turns that condition into an actionable
+# startup error instead of leaving the controller blocked forever.
+PLACEMENT_GROUP_READY_TIMEOUT_S = 600.0
 
 
 class Service:
@@ -59,19 +67,29 @@ class Service:
         self._task_ref: Optional[Any] = None
         self._heartbeat_thread: Optional[threading.Thread] = None
         self._stop_heartbeat = threading.Event()
+        self.pgs: Optional[Any] = None
+        self._deployment_submission_started = False
+        self._deployment_submitted = False
         if actor_rollout_pgs is not None:
             pgs = actor_rollout_pgs
         elif num_gpus == 0:
             pgs = None
         else:
-            pgs = create_placement_group(
-                num_gpus=num_gpus,
-                node_group_affinity=self.config.enable_affinity,
-            )
+            placement_kwargs = {
+                "num_gpus": num_gpus,
+                "node_group_affinity": self.config.enable_affinity,
+            }
+            if role in {"judge_accuracy", "judge_multiturn_vlm"}:
+                placement_kwargs["strategy"] = "STRICT_PACK"
+            pgs = create_placement_group(**placement_kwargs, role=role)
         self.pgs = pgs
         logger.info(f"[{role}] Placement group initialized: {pgs}")
 
-        self._deploy(pgs)
+        try:
+            self._deploy(pgs)
+        except BaseException:
+            self._cleanup_failed_initialization()
+            raise
         logger.info(f"[{role}] Service deployed successfully")
 
     def _deploy(self, pgs: Optional[Any] = None) -> None:
@@ -90,7 +108,32 @@ class Service:
                 self.healthy, pgs, self.num_gpus, self.config, self.role, runtime_env=self.runtime_env
             )
         logger.info(f"[{self.role}] Deploying service...")
+        self._deployment_submission_started = True
         self.handle = serve.run(self.service, name=self.role, route_prefix=f"/{self.role}")
+        self._deployment_submitted = True
+
+    def _remove_owned_placement_group(self) -> None:
+        """Remove a placement group only when this Service created it."""
+        if self.pgs is None or self._is_shared_pgs:
+            return
+        pg = self.pgs[0] if isinstance(self.pgs, tuple) else self.pgs
+        try:
+            remove_placement_group(pg)
+        except Exception as exc:
+            logger.warning(f"[{self.role}] placement group removal failed: {exc}")
+        self.pgs = None
+
+    def _cleanup_failed_initialization(self) -> None:
+        """Roll back resources created before an initial deployment failure."""
+        self._stop_heartbeat_thread()
+        if self._deployment_submission_started:
+            try:
+                serve.delete(self.role)
+            except Exception as exc:
+                logger.warning(f"[{self.role}] partial deployment delete failed: {exc}")
+        self._deployment_submission_started = False
+        self._deployment_submitted = False
+        self._remove_owned_placement_group()
 
     def _start_heartbeat(self) -> None:
         """Start background heartbeat thread to report health status."""
@@ -158,6 +201,28 @@ class Service:
         self._start_heartbeat()
         self._task_ref = self.handle.run.remote()
         return self._task_ref
+
+    def wait_ready(self, timeout: float = 600) -> dict:
+        """Block until a service's explicit readiness probe succeeds."""
+        response = self._http_call(self.role, "/ready", timeout=timeout)
+        if response.get("status") != "ready":
+            raise RuntimeError(f"Service {self.role} is not ready: {response}")
+        return response
+
+    def shutdown_owned(self) -> None:
+        """Stop a deployment and remove its self-owned placement group."""
+        self._stop_heartbeat_thread()
+        try:
+            self._http_call(self.role, "/stop_service", method="POST", timeout=30)
+        except Exception as exc:
+            logger.warning(f"[{self.role}] graceful stop failed: {exc}")
+        try:
+            serve.delete(self.role)
+        except Exception as exc:
+            logger.warning(f"[{self.role}] deployment delete failed: {exc}")
+        self._deployment_submission_started = False
+        self._deployment_submitted = False
+        self._remove_owned_placement_group()
 
     async def set_rollout_manager(self, rollout_manager: Any) -> None:
         await self.handle.set_rollout_manager.remote(rollout_manager)
@@ -237,6 +302,8 @@ class Service:
         recovery_load_path(self.config)  # Ensure config has the correct checkpoint paths after restart
         self._deploy(pgs)
         logger.info(f"[{self.role}] Service redeployed successfully")
+        if self.role in {"judge_accuracy", "judge_multiturn_vlm"}:
+            self.wait_ready()
 
         current_step = 0
         try:
@@ -286,19 +353,20 @@ class Service:
         except Exception as e:
             logger.warning(f"[{self.role}] Placement group validation failed: {e}, rebuilding")
 
-        # Cleanup broken PG
-        try:
-            pg = self.pgs[0] if isinstance(self.pgs, tuple) else self.pgs
-            remove_placement_group(pg)
-            logger.info(f"[{self.role}] Old placement group removed")
-        except Exception as e:
-            logger.warning(f"[{self.role}] Failed to remove old placement group: {e}")
+        # Cleanup broken PG before creating a replacement.  Clearing ``pgs``
+        # first prevents a failed replacement from leaving a stale handle that
+        # a later restart could mistakenly reuse.
+        self._remove_owned_placement_group()
+        logger.info(f"[{self.role}] Old placement group cleanup attempted")
 
         # Keep recovered baseline roles on the stable worker group.
-        new_pgs = create_placement_group(
-            num_gpus=self.num_gpus,
-            node_group_affinity=self.config.enable_affinity,
-        )
+        placement_kwargs = {
+            "num_gpus": self.num_gpus,
+            "node_group_affinity": self.config.enable_affinity,
+        }
+        if self.role in {"judge_accuracy", "judge_multiturn_vlm"}:
+            placement_kwargs["strategy"] = "STRICT_PACK"
+        new_pgs = create_placement_group(**placement_kwargs, role=self.role)
         self.pgs = new_pgs
         logger.info(f"[{self.role}] New placement group created")
         return new_pgs
@@ -332,7 +400,7 @@ def _require_node_group_markers(node_group: str, retries: int = 3, retry_delay: 
     )
 
 
-def create_placement_group(num_gpus, node_group_affinity=True):
+def create_placement_group(num_gpus, node_group_affinity=True, strategy="PACK", role: str | None = None):
     """Create a packed GPU placement group with optional node-group
     affinity."""
     accel_resource = device_utils.get_ray_accelerator_name()
@@ -342,25 +410,34 @@ def create_placement_group(num_gpus, node_group_affinity=True):
         _require_node_group_markers(node_group)
         base_bundle = {**base_bundle, f"{node_group}_gpu": 1, f"{node_group}_cpu": 1}
     bundles = [dict(base_bundle) for _ in range(num_gpus)]
-    pg = placement_group(bundles, strategy="PACK")
+    pg = placement_group(bundles, strategy=strategy)
     num_bundles = len(bundles)
-    ray.get(pg.ready())
-    # use info actor to get the GPU id
+    # The ready ref used to be awaited without a timeout, which meant an
+    # unschedulable dedicated judge PG could hang controller startup forever.
+    # Treat allocation and bundle introspection as one transaction: on any
+    # failure, kill helper actors and remove the newly-created PG.
     info_actors = []
-    accelerator_kwargs = get_ray_accelerator_kwargs(1)
-    for i in range(num_bundles):
-        info_actors.append(
-            InfoActor.options(
-                scheduling_strategy=PlacementGroupSchedulingStrategy(
-                    placement_group=pg,
-                    placement_group_bundle_index=i,
-                ),
-                **accelerator_kwargs,
-            ).remote()
+    try:
+        ray.get(pg.ready(), timeout=PLACEMENT_GROUP_READY_TIMEOUT_S)
+        accelerator_kwargs = get_ray_accelerator_kwargs(1)
+        for i in range(num_bundles):
+            info_actors.append(
+                InfoActor.options(
+                    scheduling_strategy=PlacementGroupSchedulingStrategy(
+                        placement_group=pg,
+                        placement_group_bundle_index=i,
+                    ),
+                    **accelerator_kwargs,
+                ).remote()
+            )
+        gpu_ids = ray.get(
+            [actor.get_ip_and_gpu_id.remote() for actor in info_actors],
+            timeout=PLACEMENT_GROUP_READY_TIMEOUT_S,
         )
-    gpu_ids = ray.get([actor.get_ip_and_gpu_id.remote() for actor in info_actors])
-    for actor in info_actors:
-        ray.kill(actor)
+    except BaseException:
+        _cleanup_failed_placement_group(pg, info_actors)
+        raise
+    _kill_info_actors(info_actors)
 
     bundle_infos = [(i, gpu_ids[i][0], gpu_ids[i][1]) for i in range(num_bundles)]
     sorted_bundle_infos = sorted(bundle_infos, key=sort_key)
@@ -375,4 +452,40 @@ def create_placement_group(num_gpus, node_group_affinity=True):
             f"node: {gpu_ids[actual_bundle_index][0]}, gpu: {gpu_ids[actual_bundle_index][1]}"
         )
 
+    manifest_dir = os.environ.get("RELAX_PLACEMENT_MANIFEST_DIR")
+    if manifest_dir and role:
+        entries = [
+            {
+                "logical_bundle_index": index,
+                "actual_bundle_index": actual_bundle_index,
+                "node_ip": gpu_ids[actual_bundle_index][0],
+                "physical_gpu_id": gpu_ids[actual_bundle_index][1],
+            }
+            for index, actual_bundle_index in enumerate(pg_reordered_bundle_indices)
+        ]
+        path = Path(manifest_dir) / f"{role}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"schema_version": 1, "role": role, "strategy": strategy, "entries": entries}, sort_keys=True)
+            + "\n",
+            encoding="utf-8",
+        )
+
     return pg, pg_reordered_bundle_indices, pg_reordered_gpu_ids
+
+
+def _kill_info_actors(info_actors: List[Any]) -> None:
+    for actor in info_actors:
+        try:
+            ray.kill(actor)
+        except Exception as exc:
+            logger.warning(f"Placement-group info actor cleanup failed: {exc}")
+
+
+def _cleanup_failed_placement_group(pg: Any, info_actors: List[Any]) -> None:
+    """Best-effort rollback for a placement group that did not initialize."""
+    _kill_info_actors(info_actors)
+    try:
+        remove_placement_group(pg)
+    except Exception as exc:
+        logger.warning(f"Failed to remove placement group after initialization failure: {exc}")
